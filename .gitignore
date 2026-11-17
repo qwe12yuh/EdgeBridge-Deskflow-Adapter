@@ -1,0 +1,8 @@
+/deskflow-upstream/
+/build/
+.DS_Store
+*.local.json
+*.pem
+*.key
+*.log
+*.sock

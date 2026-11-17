@@ -1,0 +1,1878 @@
+--- a/src/apps/deskflow-core/deskflow-core.cpp
++++ b/src/apps/deskflow-core/deskflow-core.cpp
+@@ -21,6 +21,9 @@
+ #include "arch/win32/ArchMiscWindows.h"
+ #endif
+ 
++#ifdef Q_OS_MACOS
++#include "platform/OSXAutoTypes.h"
++#endif
+ #include <QApplication>
+ #include <QFileInfo>
+ #include <QSharedMemory>
+@@ -132,7 +135,12 @@
+   coreApp->run(coreThread);
+ 
+   int exitCode = QApplication::exec();
++#ifdef Q_OS_MACOS
++  if (coreThread.isRunning()) coreApp->quit();
++  joinMacCoreThread(coreThread);
++#else
+   coreThread.wait();
++#endif
+ 
+   if (exitCode == s_exitSuccess) {
+     exitCode = coreApp->getExitCode();
+--- a/src/lib/deskflow/unix/AppUtilUnix.cpp
++++ b/src/lib/deskflow/unix/AppUtilUnix.cpp
+@@ -48,18 +48,16 @@
+       CFDictionaryCreate(nullptr, (const void **)keys, (const void **)values, 1, nullptr, nullptr), CFRelease
+   );
+   AutoCFArray kbds(nullptr, CFRelease);
+-  {
+-    std::lock_guard<std::mutex> lock(g_tisMutex);
++  onTisMainThread([&] {
+     kbds = AutoCFArray(TISCreateInputSourceList(dict.get(), false), CFRelease);
+-  }
++  });
+ 
+   for (CFIndex i = 0; i < CFArrayGetCount(kbds.get()); ++i) {
+     TISInputSourceRef keyboardLayout = (TISInputSourceRef)CFArrayGetValueAtIndex(kbds.get(), i);
+     CFArrayRef layoutLanguages = nullptr;
+-    {
+-      std::lock_guard<std::mutex> lock(g_tisMutex);
++    onTisMainThread([&] {
+       layoutLanguages = (CFArrayRef)TISGetInputSourceProperty(keyboardLayout, kTISPropertyInputSourceLanguages);
+-    }
++    });
+     char temporaryCString[128] = {0};
+     for (CFIndex index = 0; layoutLanguages && index < CFArrayGetCount(layoutLanguages); index++) {
+       auto languageCode = (CFStringRef)CFArrayGetValueAtIndex(layoutLanguages, index);
+@@ -140,12 +138,11 @@
+ #elif defined(Q_OS_MACOS)
+   AutoTISInputSourceRef source(nullptr, CFRelease);
+   CFArrayRef layoutLanguages = nullptr;
+-  {
+-    std::lock_guard<std::mutex> lock(g_tisMutex);
++  onTisMainThread([&] {
+     source = AutoTISInputSourceRef(TISCopyCurrentKeyboardInputSource(), CFRelease);
+     if (source)
+       layoutLanguages = (CFArrayRef)TISGetInputSourceProperty(source.get(), kTISPropertyInputSourceLanguages);
+-  }
++  });
+   char temporaryCString[128] = {0};
+   for (CFIndex index = 0; layoutLanguages && index < CFArrayGetCount(layoutLanguages); index++) {
+     auto languageCode = (CFStringRef)CFArrayGetValueAtIndex(layoutLanguages, index);
+--- a/src/lib/platform/IOSXKeyResource.cpp
++++ b/src/lib/platform/IOSXKeyResource.cpp
+@@ -104,12 +104,11 @@
+     // get current keyboard script
+     AutoTISInputSourceRef isref(nullptr, CFRelease);
+     CFArrayRef langs = nullptr;
+-    {
+-      std::lock_guard<std::mutex> lock(g_tisMutex);
++    onTisMainThread([&] {
+       isref = AutoTISInputSourceRef(TISCopyCurrentKeyboardInputSource(), CFRelease);
+       if (isref)
+         langs = (CFArrayRef)TISGetInputSourceProperty(isref.get(), kTISPropertyInputSourceLanguages);
+-    }
++    });
+     CFStringEncoding encoding = CFStringConvertIANACharSetNameToEncoding((CFStringRef)CFArrayGetValueAtIndex(langs, 0));
+     // convert to unicode
+     CFStringRef cfString = CFStringCreateWithCStringNoCopy(kCFAllocatorDefault, str, encoding, kCFAllocatorNull);
+--- a/src/lib/platform/OSXAutoTypes.h
++++ b/src/lib/platform/OSXAutoTypes.h
+@@ -7,11 +7,34 @@
+ 
+ #include <Carbon/Carbon.h>
+ #include <memory>
+-#include <mutex>
++#include <pthread.h>
++#include <QCoreApplication>
++#include <QEvent>
++#include <QThread>
++#include <utility>
+ 
+ using CFDeallocator = decltype(&CFRelease);
+ using AutoCFArray = std::unique_ptr<const __CFArray, CFDeallocator>;
+ using AutoCFDictionary = std::unique_ptr<const __CFDictionary, CFDeallocator>;
+ using AutoTISInputSourceRef = std::unique_ptr<__TISInputSource, CFDeallocator>;
+ 
+-inline std::mutex g_tisMutex;
++// AppKit uses the same TIS service outside Deskflow. Serializing only
++// Deskflow's callers does not exclude AppKit's main-thread lookups.
++template<class Work>
++void onTisMainThread(Work &&work)
++{
++  if (pthread_main_np()) {
++    work();
++    return;
++  }
++  QMetaObject::invokeMethod(QCoreApplication::instance(), std::forward<Work>(work), Qt::BlockingQueuedConnection);
++}
++
++inline void joinMacCoreThread(QThread &worker)
++{
++  // QApplication::exec may already have returned. A worker finishing a TIS
++  // request still needs its queued invocation delivered before it can exit.
++  while (!worker.wait(5)) {
++    QCoreApplication::sendPostedEvents(QCoreApplication::instance(), QEvent::MetaCall);
++  }
++}
+--- a/src/lib/platform/OSXKeyState.cpp
++++ b/src/lib/platform/OSXKeyState.cpp
+@@ -182,10 +182,8 @@
+   return (modifiers.find(virtualKey) != modifiers.end());
+ }
+ 
+-AutoTISInputSourceRef copyKeyboardLayoutForKeyTranslation()
+-{
+-  std::lock_guard<std::mutex> lock(g_tisMutex);
+-
++AutoTISInputSourceRef copyKeyboardLayoutForKeyTranslationOnMainThread()
++{
+   AutoTISInputSourceRef keyboardLayout(TISCopyCurrentKeyboardLayoutInputSource(), CFRelease);
+   AutoTISInputSourceRef inputSource(TISCopyCurrentKeyboardInputSource(), CFRelease);
+ 
+@@ -207,6 +205,13 @@
+   }
+ 
+   return keyboardLayout;
++}
++
++AutoTISInputSourceRef copyKeyboardLayoutForKeyTranslation()
++{
++  AutoTISInputSourceRef result(nullptr, CFRelease);
++  onTisMainThread([&] { result = copyKeyboardLayoutForKeyTranslationOnMainThread(); });
++  return result;
+ }
+ 
+ } // namespace
+@@ -335,11 +340,10 @@
+   // get keyboard info
+   AutoTISInputSourceRef currentKeyboardLayout = copyKeyboardLayoutForKeyTranslation();
+   CFDataRef ref = nullptr;
+-  {
+-    std::lock_guard<std::mutex> lock(g_tisMutex);
++  onTisMainThread([&] {
+     if (currentKeyboardLayout)
+       ref = (CFDataRef)TISGetInputSourceProperty(currentKeyboardLayout.get(), kTISPropertyUnicodeKeyLayoutData);
+-  }
++  });
+ 
+   if (!currentKeyboardLayout) {
+     return kKeyNone;
+@@ -474,12 +478,11 @@
+ {
+   AutoTISInputSourceRef keyboardLayout(nullptr, CFRelease);
+   CFDataRef id = nullptr;
+-  {
+-    std::lock_guard<std::mutex> lock(g_tisMutex);
++  onTisMainThread([&] {
+     keyboardLayout = AutoTISInputSourceRef(TISCopyCurrentKeyboardLayoutInputSource(), CFRelease);
+     if (keyboardLayout)
+       id = (CFDataRef)TISGetInputSourceProperty(keyboardLayout.get(), kTISPropertyInputSourceID);
+-  }
++  });
+ 
+   GroupMap::const_iterator i = m_groupMap.find(id);
+   if (i != m_groupMap.end()) {
+@@ -515,10 +518,9 @@
+     for (int32_t g = 0; g < numGroups; ++g) {
+       TISInputSourceRef keyboardLayout = (TISInputSourceRef)CFArrayGetValueAtIndex(m_groups.get(), g);
+       CFDataRef id = nullptr;
+-      {
+-        std::lock_guard<std::mutex> lock(g_tisMutex);
++      onTisMainThread([&] {
+         id = (CFDataRef)TISGetInputSourceProperty(keyboardLayout, kTISPropertyInputSourceID);
+-      }
++      });
+       m_groupMap[id] = g;
+     }
+   }
+@@ -534,10 +536,9 @@
+     // add regular keys from the layout's key data
+     TISInputSourceRef keyboardLayout = (TISInputSourceRef)CFArrayGetValueAtIndex(m_groups.get(), g);
+     CFDataRef resourceRef = nullptr;
+-    {
+-      std::lock_guard<std::mutex> lock(g_tisMutex);
++    onTisMainThread([&] {
+       resourceRef = (CFDataRef)TISGetInputSourceProperty(keyboardLayout, kTISPropertyUnicodeKeyLayoutData);
+-    }
++    });
+ 
+     layoutValid = resourceRef != nullptr;
+     if (layoutValid)
+@@ -936,10 +937,9 @@
+       CFDictionaryCreate(nullptr, (const void **)keys, (const void **)values, 1, nullptr, nullptr), CFRelease
+   );
+   AutoCFArray kbds(nullptr, CFRelease);
+-  {
+-    std::lock_guard<std::mutex> lock(g_tisMutex);
++  onTisMainThread([&] {
+     kbds = AutoCFArray(TISCreateInputSourceList(dict.get(), false), CFRelease);
+-  }
++  });
+ 
+   if (CFArrayGetCount(kbds.get()) > 0) {
+     groups = std::move(kbds);
+@@ -958,24 +958,22 @@
+     LOG_WARN("needed keyboard layout is null");
+     return;
+   }
+-  CFBooleanRef canBeSetted = nullptr;
+-  {
+-    std::lock_guard<std::mutex> lock(g_tisMutex);
++  bool canSet = false;
++  onTisMainThread([&] {
+     AutoTISInputSourceRef source(TISCopyCurrentKeyboardInputSource(), CFRelease);
+     if (source)
+-      canBeSetted = (CFBooleanRef)TISGetInputSourceProperty(source.get(), kTISPropertyInputSourceIsEnableCapable);
+-  }
+-  if (!canBeSetted) {
++      canSet = TISGetInputSourceProperty(source.get(), kTISPropertyInputSourceIsEnableCapable) != nullptr;
++  });
++  if (!canSet) {
+     LOG_WARN("needed keyboard layout is disabled for programmatically selection");
+     return;
+   }
+ 
+-  {
+-    std::lock_guard<std::mutex> lock(g_tisMutex);
++  onTisMainThread([&] {
+     if (TISSelectInputSource(keyboardLayout) != noErr) {
+       LOG_WARN("failed to set needed keyboard layout");
+     }
+-  }
++  });
+ 
+   LOG_VERBOSE("keyboard layout change to %d", group);
+ 
+--- a/src/unittests/platform/CMakeLists.txt
++++ b/src/unittests/platform/CMakeLists.txt
+@@ -10,6 +10,11 @@
+     WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/src/lib/platform"
+   )
+ elseif(APPLE)
++  add_executable(OSXTisThreadTests OSXTisThreadTests.cpp)
++  target_include_directories(OSXTisThreadTests PRIVATE "${CMAKE_SOURCE_DIR}/src/lib")
++  target_link_libraries(OSXTisThreadTests PRIVATE Qt6::Core "-framework Carbon")
++  add_test(NAME OSXTisThreadTests COMMAND OSXTisThreadTests)
++  set_tests_properties(OSXTisThreadTests PROPERTIES TIMEOUT 10)
+   create_test(
+     NAME OSXClipboardTests
+     DEPENDS platform
+--- /dev/null
++++ b/src/unittests/platform/OSXTisThreadTests.cpp
+@@ -0,0 +1,32 @@
++// SPDX-License-Identifier: GPL-2.0-only WITH LicenseRef-OpenSSL-Exception
++#include "platform/OSXAutoTypes.h"
++
++#include <QSemaphore>
++#include <atomic>
++#include <cstdio>
++
++// Pure read of keyboard metadata; no display, event tap or input synthesis.
++int main(int argc, char **argv)
++{
++  QCoreApplication app(argc, argv);
++  std::atomic<unsigned> checks{0};
++  auto readLayout = [&] {
++    if (!pthread_main_np()) return;
++    AutoTISInputSourceRef layout(TISCopyCurrentKeyboardLayoutInputSource(), CFRelease);
++    if (layout && TISGetInputSourceProperty(layout.get(), kTISPropertyInputSourceID)) ++checks;
++  };
++  onTisMainThread(readLayout);
++  QSemaphore shutdown;
++  auto worker = std::unique_ptr<QThread>(QThread::create([&] {
++    onTisMainThread(readLayout);
++    QMetaObject::invokeMethod(&app, &QCoreApplication::quit, Qt::QueuedConnection);
++    shutdown.acquire();
++    onTisMainThread(readLayout);
++  }));
++  worker->start();
++  app.exec();
++  shutdown.release();
++  joinMacCoreThread(*worker);
++  if (checks != 3) return 1;
++  std::puts("PASS: real TIS reads on main, from worker, and after Qt event loop shutdown");
++}
+--- /dev/null
++++ b/src/lib/deskflow/EdgeRouteInput.h
+@@ -0,0 +1,177 @@
++// SPDX-License-Identifier: GPL-2.0-only WITH LicenseRef-OpenSSL-Exception
++#pragma once
++
++#include <atomic>
++#include <cstdint>
++#include <cstdlib>
++#include <limits>
++
++// The Quartz HID callback is the sole writer of button edges. The server's
++// Deskflow event-queue thread manages the lease. Neither thread waits for IPC.
++namespace edgeinput {
++inline std::atomic<bool> enabled{false};
++inline std::atomic<uint64_t> downTimeNs{0};
++inline std::atomic<int64_t> downNumber{0}, reverseUpNumber{0};
++inline std::atomic<uint64_t> button{0}; // (generation << 1) | held
++inline std::atomic<uint64_t> permit{0}, consumed{0}, escaped{0}, leased{0};
++inline std::atomic<bool> consumeEscapeUp{false}, suppressedPress{false};
++// A reverse handoff owns the up only after the Windows source acknowledged
++// its local drop. AppKit receives it after its own willBeginAt callback.
++inline std::atomic<uint64_t> reverseOwned{0}, reverseArmed{0}, reverseDelivered{0};
++// Preserve the delivered release through any later click swallowed by the
++// cleanup guard. Compare only local CLOCK_UPTIME_RAW samples with AppKit's
++// systemUptime. The CGEvent timestamp is opaque diagnostic data.
++inline std::atomic<uint64_t> reverseUpTimeNs{0}, reverseRawUpStamp{0};
++inline std::atomic<int> reverseUpQuartzX{0}, reverseUpQuartzY{0};
++inline std::atomic<unsigned> reverseMoves{0}, reverseDrags{0};
++inline std::atomic<int> travelX{0}, travelY{0};
++inline std::atomic<uint64_t> finishing{0}, tapFault{0};
++inline std::atomic<int> boundary{std::numeric_limits<int>::max()};
++inline std::atomic<uint64_t> outward{0};
++inline std::atomic<bool> atBoundary{false};
++inline std::atomic<uint64_t> downSeen{0}, dragSeen{0}, acceptedDrags{0}, draggedGeneration{0};
++inline std::atomic<int> startX{0}, startY{0}, dragX{0};
++constexpr uint32_t marker = 0x45424745;
++// A start has two destructive gates: HID admits the tagged event into the
++// login session, then an annotated tap checks the actual WindowServer target.
++// The HID debt is independent of the route lease: cleanup must let the real
++// up balance a down even after cancellation, timeout or coordinator EOF.
++constexpr uint32_t destinationMarker = 0x45424453;
++constexpr uint32_t cleanupUpMarker = 0x45424455;
++inline std::atomic<bool> destinationTapReady{false};
++inline std::atomic<uint64_t> destinationGate{0}, destinationGen{0}, destinationExpiry{0};
++inline std::atomic<uint64_t> destinationDebt{0}, destinationAccepted{0}, destinationRejected{0};
++inline std::atomic<int64_t> destinationPid{0}, destinationWindow{0};
++inline std::atomic<int64_t> observedSourcePid{0}, observedTargetPid{0}, observedTargetWindow{0}, observedNumber{0};
++inline std::atomic<uint64_t> destinationHidRejected{0};
++inline bool destinationHeld(uint64_t gen, uint64_t now)
++{
++  return gen && destinationTapReady && leased == gen && reverseOwned == gen &&
++         escaped != gen && button == gen * 2 + 1 && now <= destinationExpiry.load();
++}
++inline bool admitDestinationDown(uint64_t nonce, int64_t pid, int64_t number, uint64_t now)
++{
++  const auto gen = destinationGen.load();
++  if (destinationGate.load() != nonce) return false;
++  if (!destinationHeld(gen, now) || !pid || pid != destinationPid || number != downNumber) {
++    observedSourcePid = pid;
++    observedNumber = number;
++    destinationHidRejected = gen;
++    destinationGate.compare_exchange_strong(nonce, 0);
++    return false;
++  }
++  if (!destinationGate.compare_exchange_strong(nonce, ~nonce)) return false;
++  destinationDebt = gen;
++  return true;
++}
++inline bool annotateDestinationDown(uint64_t nonce, int64_t sourcePid, int64_t targetPid, int64_t window, uint64_t now)
++{
++  const auto gen = destinationGen.load();
++  auto pending = ~nonce;
++  if (!destinationGate.compare_exchange_strong(pending, 0)) return false;
++  if (!destinationHeld(gen, now) || destinationDebt != gen || sourcePid != destinationPid ||
++      targetPid != destinationPid || window != destinationWindow) {
++    observedSourcePid = sourcePid;
++    observedTargetPid = targetPid;
++    observedTargetWindow = window;
++    destinationRejected = gen;
++    return false;
++  }
++  destinationAccepted = gen;
++  return true;
++}
++inline bool tookSourceLeft()
++{
++  auto gen = button.load() >> 1;
++  return gen != 0 && consumed.load() == gen;
++}
++inline bool down(uint64_t timestampNs, int x = 0, int y = 0, int64_t eventNumber = 0)
++{
++  auto state = button.load();
++  if (!(state & 1)) {
++    // A tap-disable interval can hide an up. A fresh physical press cannot
++    // inherit any accounting or annotation from the preceding press.
++    destinationDebt = 0;
++    startX = x;
++    startY = y;
++    travelX = 0;
++    travelY = 0;
++    downTimeNs = timestampNs;
++    downNumber = eventNumber;
++    button = ((state >> 1) + 1) * 2 + 1;
++    atBoundary = false;
++    auto draining = finishing.load();
++    suppressedPress = draining && leased.load() == draining;
++  }
++  return suppressedPress.load();
++}
++inline bool up(bool onPrimary = false, uint64_t timeNs = 0, int64_t eventNumber = 0)
++{
++  auto state = button.load();
++  bool suppress = suppressedPress.exchange(false);
++  auto gen = state >> 1;
++  bool returning = reverseOwned.load() == gen;
++  if ((state & 1) && !suppress && (returning || consumed.load() == gen)) {
++    // Arm before the next HID down can arrive, even if the routing queue is busy.
++    if (leased.load() == gen) finishing = gen;
++    suppress = true;
++    if (returning && onPrimary && leased.load() == gen && escaped.load() != gen && reverseArmed.load() == gen) {
++      reverseUpTimeNs = timeNs >= downTimeNs.load() ? timeNs : 0;
++      reverseUpNumber = eventNumber;
++      reverseDelivered = gen;
++      suppress = false; // deliver this physical up to the armed AppKit session
++    }
++  }
++  // Publish the released state only after its generation and timestamp, so
++  // the independent Deskflow event queue cannot observe a half-written up.
++  if (gen && destinationDebt.load() == gen) {
++    destinationDebt = 0;
++    suppress = false;
++  }
++  button = state & ~uint64_t{1};
++  return suppress;
++}
++inline void leftDrag(int x, int y, int dx, int dy)
++{
++  ++acceptedDrags;
++  auto state = button.load();
++  if (!(state & 1) || suppressedPress) return;
++  dragX = x;
++  // An actual left-drag event is necessary. Include raw deltas for a cursor
++  // that has already been clamped against the physical right edge.
++  if (std::abs(x - startX.load()) + std::abs(y - startY.load()) >= 6 ||
++      std::abs(dx) + std::abs(dy) >= 6) draggedGeneration = state >> 1;
++}
++inline void offscreenMotion(int dx, int dy)
++{
++  auto state = button.load();
++  if (!(state & 1) || suppressedPress || draggedGeneration == (state >> 1)) return;
++  // Cursor coordinates on a secondary are virtual. Raw HID deltas survive
++  // Deskflow's primary cursor freeze and also cover slow sub-threshold steps.
++  travelX += dx;
++  travelY += dy;
++  if (std::abs(travelX.load()) + std::abs(travelY.load()) >= 6) draggedGeneration = state >> 1;
++}
++inline void motion(int x, int dx)
++{
++  atBoundary = x >= boundary.load();
++  if (atBoundary && dx > 0 && (button.load() & 1)) ++outward;
++}
++inline bool acceptMarker(uint64_t gen, int x)
++{
++  if (!gen || button.load() != gen * 2 + 1 || x < boundary.load() ||
++      !atBoundary || escaped.load() == gen || !permit.compare_exchange_strong(gen, 0)) return false;
++  consumed = gen;
++  return true;
++}
++inline bool escape()
++{
++  auto state = button.load();
++  if (!(state & 1) || leased.load() != (state >> 1)) return false;
++  escaped = state >> 1;
++  bool capture = consumed.load() == (state >> 1) ||
++                 (reverseOwned.load() == (state >> 1) && reverseArmed.load() != (state >> 1));
++  consumeEscapeUp = capture;
++  return capture;
++}
++}
+--- a/src/lib/platform/OSXComputer.h
++++ b/src/lib/platform/OSXComputer.h
+@@ -300,6 +300,8 @@
+   static bool s_hasGHOM;
+ 
+   // Quartz input event support
++  CFMachPortRef m_targetTapPort = nullptr;
++  CFRunLoopSourceRef m_targetTapSource = nullptr;
+   CFMachPortRef m_eventTapPort;
+   CFRunLoopSourceRef m_eventTapRLSR;
+   std::thread m_eventTapThread;
+--- a/src/lib/platform/OSXComputer.mm
++++ b/src/lib/platform/OSXComputer.mm
+@@ -20,6 +20,7 @@
+ #include "common/Settings.h"
+ #include "deskflow/ClientApp.h"
+ #include "deskflow/Clipboard.h"
++#include "deskflow/EdgeRouteInput.h"
+ #include "deskflow/DisplayInvalidException.h"
+ #include "deskflow/KeyMap.h"
+ #include "mt/CondVar.h"
+@@ -305,7 +306,9 @@
+ 
+ bool OSXComputer::isAnyMouseButtonDown(uint32_t &buttonID) const
+ {
+-  if (m_buttonState.test(0)) {
++  if (m_buttonState.test(0) ||
++      (edgeinput::enabled && m_isPrimary && (edgeinput::button.load() & 1) &&
++       (!m_isOnComputer || edgeinput::tookSourceLeft()))) {
+     buttonID = kButtonLeft;
+     return true;
+   }
+@@ -689,6 +692,36 @@
+   m_cursorHidden = true;
+ }
+ 
++// Inspect only our marked down and a cancelled gesture's balancing up. Ordinary
++// events pass unchanged. No IPC, window enumeration or blocking lookup here.
++static CGEventRef checkDestinationEvent(CGEventTapProxy, CGEventType type, CGEventRef event, void *)
++{
++  if (type == kCGEventTapDisabledByTimeout || type == kCGEventTapDisabledByUserInput) {
++    edgeinput::destinationTapReady = false;
++    edgeinput::destinationGate = 0;
++    ++edgeinput::tapFault;
++    return event;
++  }
++  if (!event) return event;
++  const uint64_t tag = CGEventGetIntegerValueField(event, kCGEventSourceUserData);
++  const auto marker = static_cast<uint32_t>(tag >> 32);
++  if (type == kCGEventLeftMouseDown && marker == edgeinput::destinationMarker) {
++    return edgeinput::annotateDestinationDown(tag, CGEventGetIntegerValueField(event, kCGEventSourceUnixProcessID),
++        CGEventGetIntegerValueField(event, kCGEventTargetUnixProcessID),
++        CGEventGetIntegerValueField(event, kCGMouseEventWindowUnderMousePointerThatCanHandleThisEvent),
++        clock_gettime_nsec_np(CLOCK_UPTIME_RAW)) ? event : nullptr;
++  }
++  if (type == kCGEventLeftMouseUp && marker == edgeinput::cleanupUpMarker) {
++    // WindowServer has processed the physical release. Do not send an orphan
++    // cleanup click to Finder or another app if the helper exited or moved.
++    return edgeinput::destinationAccepted == static_cast<uint32_t>(tag) &&
++           CGEventGetIntegerValueField(event, kCGEventTargetUnixProcessID) == edgeinput::destinationPid &&
++           CGEventGetIntegerValueField(event, kCGMouseEventWindowUnderMousePointerThatCanHandleThisEvent) ==
++               edgeinput::destinationWindow ? event : nullptr;
++  }
++  return event;
++}
++
+ void OSXComputer::enable()
+ {
+   // watch the clipboard
+@@ -724,6 +757,15 @@
+   }
+ 
+   if (m_eventTapPort) {
++    const auto *routePath = std::getenv("EDGEBRIDGE_ROUTE_SOCKET");
++    if (m_isPrimary && routePath && *routePath) {
++      const auto mask = CGEventMaskBit(kCGEventLeftMouseDown) | CGEventMaskBit(kCGEventLeftMouseUp);
++      m_targetTapPort = CGEventTapCreate(kCGAnnotatedSessionEventTap, kCGTailAppendEventTap,
++                                         kCGEventTapOptionDefault, mask, checkDestinationEvent, nullptr);
++      if (m_targetTapPort)
++        m_targetTapSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, m_targetTapPort, 0);
++      if (!m_targetTapSource) LOG_WARN("experimental destination start unavailable: annotated tap not ready");
++    }
+     m_eventTapRLSR = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, m_eventTapPort, 0);
+     if (m_eventTapRLSR) {
+       // Run the event tap on a dedicated thread with its own CFRunLoop so it fires
+@@ -733,8 +775,17 @@
+       m_eventTapThread = std::thread([this, sem]() {
+         m_eventTapRunLoop = CFRunLoopGetCurrent();
+         CFRunLoopAddSource(m_eventTapRunLoop, m_eventTapRLSR, kCFRunLoopDefaultMode);
++        if (m_targetTapSource) {
++          CFRunLoopAddSource(m_eventTapRunLoop, m_targetTapSource, kCFRunLoopDefaultMode);
++          edgeinput::destinationTapReady = CGEventTapIsEnabled(m_targetTapPort);
++        }
+         dispatch_semaphore_signal(sem);
+         CFRunLoopRun();
++        if (m_targetTapSource) {
++          edgeinput::destinationTapReady = false;
++          edgeinput::destinationGate = 0;
++          CFRunLoopRemoveSource(m_eventTapRunLoop, m_targetTapSource, kCFRunLoopDefaultMode);
++        }
+         CFRunLoopRemoveSource(CFRunLoopGetCurrent(), m_eventTapRLSR, kCFRunLoopDefaultMode);
+         m_eventTapRunLoop = nullptr;
+       });
+@@ -761,6 +812,15 @@
+     m_eventTapThread.join();
+   }
+ 
++  if (m_targetTapSource) {
++    CFRelease(m_targetTapSource);
++    m_targetTapSource = nullptr;
++  }
++  if (m_targetTapPort) {
++    CFMachPortInvalidate(m_targetTapPort);
++    CFRelease(m_targetTapPort);
++    m_targetTapPort = nullptr;
++  }
+   if (m_eventTapRLSR) {
+     CFRelease(m_eventTapRLSR);
+     m_eventTapRLSR = nullptr;
+@@ -1297,6 +1357,9 @@
+ {
+   uint32_t buttons = GetCurrentButtonState();
+ 
++  // leavePrimary snapshots GetCurrentButtonState while the hardware is still
++  // down. Do not latch this leased left bit in Deskflow's synthetic-button cache.
++  if (edgeinput::enabled && m_isPrimary && edgeinput::tookSourceLeft()) buttons &= ~uint32_t{1};
+   m_buttonState.overwrite(buttons);
+ }
+ 
+@@ -1679,6 +1742,80 @@
+ CGEventRef OSXComputer::handleCGInputEvent(CGEventTapProxy proxy, CGEventType type, CGEventRef event, void *refcon)
+ {
+   OSXComputer *computer = (OSXComputer *)refcon;
++
++  if (edgeinput::enabled && (type == kCGEventTapDisabledByTimeout || type == kCGEventTapDisabledByUserInput)) {
++    ++edgeinput::tapFault;
++    edgeinput::destinationGate = 0;
++    edgeinput::permit = 0;
++    edgeinput::button.fetch_and(~uint64_t{1});
++    edgeinput::suppressedPress = false;
++    edgeinput::consumeEscapeUp = false;
++  } else if (edgeinput::enabled && event) {
++    // CGEventGetTimestamp values from this physical HID tap have been observed
++    // in Mach ticks on Apple Silicon. Timestamp arrival here, using the same
++    // uptime nanoseconds as the route's leases and the receiving app.
++    const auto tapUptimeNs = (type == kCGEventLeftMouseUp || type == kCGEventLeftMouseDown)
++                                 ? clock_gettime_nsec_np(CLOCK_UPTIME_RAW) : 0;
++    uint64_t tag = CGEventGetIntegerValueField(event, kCGEventSourceUserData);
++    if (type == kCGEventLeftMouseDown && (tag >> 32) == edgeinput::destinationMarker) {
++      // The synthetic edge must never reach the Deskflow button relay.
++      return computer->m_isOnComputer && computer->m_targetTapPort && CGEventTapIsEnabled(computer->m_targetTapPort) &&
++          edgeinput::admitDestinationDown(tag, CGEventGetIntegerValueField(event, kCGEventSourceUnixProcessID),
++                                          CGEventGetIntegerValueField(event, kCGMouseEventNumber), tapUptimeNs)
++          ? event : nullptr;
++    }
++    if (type == kCGEventLeftMouseUp && static_cast<uint32_t>(tag) == edgeinput::marker) {
++      // Deliver the bounded source drop to AppKit, without forwarding it as a physical up.
++      return computer->m_isOnComputer && edgeinput::acceptMarker(tag >> 32, CGEventGetLocation(event).x) ? event : nullptr;
++    }
++    if (type == kCGEventLeftMouseDown) ++edgeinput::downSeen;
++    if (type == kCGEventLeftMouseDragged) ++edgeinput::dragSeen;
++    // Events created by a user-space process are not fresh hardware gestures.
++    if (CGEventGetIntegerValueField(event, kCGEventSourceUnixProcessID) == 0) {
++      if (type == kCGEventLeftMouseDown) {
++        auto pos = CGEventGetLocation(event);
++        if (edgeinput::down(tapUptimeNs, pos.x, pos.y, CGEventGetIntegerValueField(event, kCGMouseEventNumber))) return nullptr;
++      }
++      if (type == kCGEventLeftMouseDragged) {
++        auto pos = CGEventGetLocation(event);
++        edgeinput::leftDrag(pos.x, pos.y, CGEventGetIntegerValueField(event, kCGMouseEventDeltaX),
++                           CGEventGetIntegerValueField(event, kCGMouseEventDeltaY));
++      }
++      auto gen = edgeinput::reverseArmed.load();
++      if (gen && computer->m_isOnComputer && edgeinput::button == gen * 2 + 1) {
++        if (type == kCGEventMouseMoved) ++edgeinput::reverseMoves;
++        if (type == kCGEventLeftMouseDragged) ++edgeinput::reverseDrags;
++        if (type == kCGEventLeftMouseUp) {
++          auto pos = CGEventGetLocation(event);
++          edgeinput::reverseUpQuartzX = static_cast<int>(pos.x);
++          edgeinput::reverseUpQuartzY = static_cast<int>(pos.y);
++          edgeinput::reverseRawUpStamp = CGEventGetTimestamp(event);
++        }
++      }
++      if (type == kCGEventLeftMouseUp) {
++        const auto debt = edgeinput::destinationDebt.load();
++        if (edgeinput::up(computer->m_isOnComputer, tapUptimeNs, CGEventGetIntegerValueField(event, kCGMouseEventNumber)))
++          return nullptr;
++        if (debt && edgeinput::reverseDelivered != debt) {
++          // Balance the already admitted down even after coordinator EOF or
++          // return to a secondary; this cleanup does not enter the KVM relay.
++          CGEventSetIntegerValueField(event, kCGEventSourceUserData,
++              (uint64_t{edgeinput::cleanupUpMarker} << 32) | static_cast<uint32_t>(debt));
++          return event;
++        }
++      }
++      if (type == kCGEventLeftMouseDragged || type == kCGEventMouseMoved) {
++        int dx = CGEventGetIntegerValueField(event, kCGMouseEventDeltaX);
++        if (computer->m_isOnComputer) edgeinput::motion(CGEventGetLocation(event).x, dx);
++        else edgeinput::offscreenMotion(dx, CGEventGetIntegerValueField(event, kCGMouseEventDeltaY));
++
++      }
++      if (CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode) == 53) {
++        if (type == kCGEventKeyDown && (edgeinput::consumeEscapeUp || edgeinput::escape())) return nullptr;
++        if (type == kCGEventKeyUp && edgeinput::consumeEscapeUp.exchange(false)) return nullptr;
++      }
++    }
++  }
+ 
+   switch (type) {
+   case kCGEventLeftMouseDown:
+--- a/src/lib/server/CMakeLists.txt
++++ b/src/lib/server/CMakeLists.txt
+@@ -40,6 +40,10 @@
+   Server.h
+ )
+ 
++if(APPLE)
++  target_sources(server PRIVATE EdgeRoute.cpp EdgeRoute.h)
++endif()
++
+ target_link_libraries(server PUBLIC common)
+ 
+ if(UNIX)
+--- a/src/lib/server/Server.cpp
++++ b/src/lib/server/Server.cpp
+@@ -7,6 +7,9 @@
+  */
+ 
+ #include "server/Server.h"
++#ifdef __APPLE__
++#include "server/EdgeRoute.h"
++#endif
+ 
+ #include "base/IEventQueue.h"
+ #include "base/Log.h"
+@@ -26,9 +29,9 @@
+ #include "server/PrimaryClient.h"
+ 
+ #ifdef _WIN32
+-#include <algorithm>
+ #include <array>
+ #endif
++#include <algorithm>
+ #include <cmath>
+ #include <cstdlib>
+ #include <cstring>
+@@ -54,6 +57,42 @@
+   assert(m_computer != nullptr);
+ 
+   std::string primaryName = getName(primaryClient);
++
++#ifdef __APPLE__
++  if (auto *routePath = std::getenv("EDGEBRIDGE_ROUTE_SOCKET"); routePath && *routePath) {
++    m_edgeRoute = new EdgeRoute({
++      [this]() -> std::optional<EdgeRoute::Entry> {
++        if (isLockedToComputerServer()) return {};
++        int ax, ay, aw, ah;
++        m_active->getShape(ax, ay, aw, ah);
++        if (aw < 2 || ah < 2) return {};
++        bool primary = m_active == m_primaryClient;
++        int x = primary ? ax + aw : ax - 1;
++        int y = std::clamp(m_y, ay, ay + ah - 1);
++        auto *dst = mapToNeighbor(m_active, primary ? Direction::Right : Direction::Left, x, y);
++        if (!dst || dst == m_active || (!primary && dst != m_primaryClient)) return {};
++        return EdgeRoute::Entry{primary ? ax + aw - 1 : ax, x, y, m_x, primary,
++                                QString::fromStdString(getName(m_active)), QString::fromStdString(getName(dst))};
++      },
++      [this](const std::string &name, const EdgeRoute::Entry &entry) {
++        auto client = m_clients.find(name);
++        if (client == m_clients.end()) return false;
++        switchComputer(client->second, entry.x, entry.y, false);
++        return m_active == client->second;
++      },
++      [this] { return m_active == m_primaryClient; },
++      [this] { return getName(m_active); },
++    });
++    if (!m_edgeRoute->listening()) {
++      delete m_edgeRoute;
++      m_edgeRoute = nullptr;
++      throw DeskflowException(QStringLiteral("required experimental gesture route is unavailable: %1").arg(routePath));
++    }
++    m_edgeRouteTimer = m_events->newTimer(0.008, nullptr);
++    m_events->addHandler(EventTypes::Timer, m_edgeRouteTimer, [this](const auto &) { m_edgeRoute->poll(); });
++    LOG_INFO("experimental gesture route listening at %s", routePath);
++  }
++#endif
+ 
+   // clear clipboards
+   for (auto &clipboard : m_clipboards) {
+@@ -152,6 +191,13 @@
+ 
+ Server::~Server()
+ {
++#ifdef __APPLE__
++  if (m_edgeRouteTimer) {
++    m_events->removeHandler(EventTypes::Timer, m_edgeRouteTimer);
++    m_events->deleteTimer(m_edgeRouteTimer);
++  }
++  delete m_edgeRoute;
++#endif
+   // remove event handlers and timers
+   using enum EventTypes;
+   m_events->removeHandler(KeyStateKeyDown, m_inputFilter);
+@@ -365,6 +411,9 @@
+ 
+ bool Server::isLockedToComputer() const
+ {
++#ifdef __APPLE__
++  if (m_edgeRoute && m_edgeRoute->active()) return true;
++#endif
+   if (m_disableLockToComputer) {
+     return false;
+   }
+@@ -1288,6 +1337,9 @@
+ 
+ void Server::handleClientDisconnected(BaseClientProxy *client)
+ {
++#ifdef __APPLE__
++  if (m_edgeRoute) m_edgeRoute->targetLost(getName(client));
++#endif
+   // client has disconnected.  it might be an old client or an
+   // active client.  we don't care so just handle it both ways.
+   removeActiveClient(client);
+@@ -1764,6 +1816,10 @@
+   int32_t ah;
+   m_active->getShape(ax, ay, aw, ah);
+ 
++#ifdef __APPLE__
++  if (m_edgeRoute) m_edgeRoute->secondaryMotion(m_x, ax, dx);
++#endif
++
+   // find direction of neighbor and get the neighbor
+   bool jump = true;
+   BaseClientProxy *newComputer;
+--- a/src/lib/server/Server.h
++++ b/src/lib/server/Server.h
+@@ -22,6 +22,7 @@
+ #include <set>
+ #include <vector>
+ 
++class EdgeRoute;
+ class BaseClientProxy;
+ class EventQueueTimer;
+ class PrimaryClient;
+@@ -39,6 +40,10 @@
+ */
+ class Server
+ {
++#ifdef __APPLE__
++  EdgeRoute *m_edgeRoute = nullptr;
++  EventQueueTimer *m_edgeRouteTimer = nullptr;
++#endif
+   using ServerConfig = deskflow::server::Config;
+ 
+ public:
+--- /dev/null
++++ b/src/lib/server/EdgeRoute.cpp
+@@ -0,0 +1,497 @@
++// SPDX-License-Identifier: GPL-2.0-only WITH LicenseRef-OpenSSL-Exception
++#include "server/EdgeRoute.h"
++#include <QDebug>
++#include "deskflow/EdgeRouteInput.h"
++
++#include <QJsonDocument>
++#include <QUuid>
++#include <QScopeGuard>
++#include <QRandomGenerator>
++#include <cerrno>
++#include <cmath>
++#include <cstdlib>
++#include <time.h>
++#include <cstring>
++#include <fcntl.h>
++#include <filesystem>
++#include <sys/file.h>
++#include <sys/socket.h>
++#include <sys/stat.h>
++#include <sys/un.h>
++#include <unistd.h>
++
++using namespace std::chrono_literals;
++namespace {
++bool configure(int fd)
++{
++  return fcntl(fd, F_SETFL, O_NONBLOCK) == 0 && fcntl(fd, F_SETFD, FD_CLOEXEC) == 0;
++}
++bool sameOwnedSocket(const char *path, dev_t device, ino_t inode)
++{
++  struct stat now{};
++  return lstat(path, &now) == 0 && S_ISSOCK(now.st_mode) && now.st_uid == geteuid() &&
++         now.st_dev == device && now.st_ino == inode;
++}
++
++// A dead listener leaves its filesystem node behind on macOS. A pathname or
++// file type alone is insufficient evidence that the former listener is gone.
++bool reclaimRefusedSocket(const sockaddr_un &addr)
++{
++  struct stat before{};
++  if (lstat(addr.sun_path, &before) || !S_ISSOCK(before.st_mode) || before.st_uid != geteuid()) return false;
++  int probe = socket(AF_UNIX, SOCK_STREAM, 0);
++  if (probe < 0) return false;
++  auto cleanup = qScopeGuard([&] { close(probe); });
++  if (!configure(probe) || connect(probe, reinterpret_cast<const sockaddr *>(&addr), sizeof(addr)) == 0) return false;
++  if (errno != ECONNREFUSED || !sameOwnedSocket(addr.sun_path, before.st_dev, before.st_ino)) return false;
++  return unlink(addr.sun_path) == 0;
++}
++bool temporary() { return errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR; }
++}
++
++EdgeRoute::EdgeRoute(Screens s) : screens(std::move(s))
++{
++  auto setting = std::getenv("EDGEBRIDGE_ROUTE_SOCKET");
++  if (!setting || !*setting) return;
++  const std::filesystem::path path(setting);
++  struct stat st{};
++  sockaddr_un addr{};
++  if (!path.is_absolute() || path.string().size() >= sizeof(addr.sun_path) ||
++      lstat(path.parent_path().c_str(), &st) || !S_ISDIR(st.st_mode) ||
++      st.st_uid != geteuid() || (st.st_mode & 0077)) {
++    qWarning("experimental route requires a short absolute path inside a private directory");
++    return;
++  }
++  // Serialize check/reclaim/bind/listen between independent lab startups.
++  int dir = open(path.parent_path().c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
++  if (dir < 0) return;
++  auto closeDir = qScopeGuard([&] { close(dir); });
++  struct stat opened{};
++  if (fstat(dir, &opened) || opened.st_dev != st.st_dev || opened.st_ino != st.st_ino ||
++      flock(dir, LOCK_EX | LOCK_NB)) {
++    qWarning("experimental route directory changed or initialization is already in progress");
++    return;
++  }
++  addr.sun_family = AF_UNIX;
++  std::strcpy(addr.sun_path, path.c_str());
++  int fd = socket(AF_UNIX, SOCK_STREAM, 0);
++  if (fd < 0) return;
++  auto closeFailed = qScopeGuard([&] { close(fd); });
++  if (!configure(fd)) return;
++  auto bindRoute = [&] { return bind(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)); };
++  if (bindRoute() != 0) {
++    int error = errno;
++    if (error != EADDRINUSE || !reclaimRefusedSocket(addr) || bindRoute() != 0) {
++      qWarning("experimental route unavailable at %s (%s); an existing path is only reclaimed for a refused, owned socket",
++               addr.sun_path, strerror(error));
++      return;
++    }
++  }
++  struct stat bound{};
++  if (lstat(path.c_str(), &bound) || !S_ISSOCK(bound.st_mode) || bound.st_uid != geteuid()) return;
++  if (chmod(path.c_str(), 0600) || listen(fd, 1)) {
++    if (sameOwnedSocket(path.c_str(), bound.st_dev, bound.st_ino)) unlink(path.c_str());
++    return;
++  }
++  socketDevice = bound.st_dev;
++  socketInode = bound.st_ino;
++  closeFailed.dismiss();
++  listener = fd;
++  socketPath = path.string();
++  edgeinput::enabled = true;
++}
++EdgeRoute::~EdgeRoute()
++{
++  if (listener < 0) return;
++  closePeer();
++  reset();
++  edgeinput::enabled = false;
++  if (sameOwnedSocket(socketPath.c_str(), socketDevice, socketInode)) unlink(socketPath.c_str());
++  close(listener);
++}
++void EdgeRoute::reset()
++{
++  edgeinput::permit = 0;
++  edgeinput::destinationGate = 0;
++  edgeinput::reverseArmed = 0;
++  edgeinput::leased = 0;
++  edgeinput::finishing = 0;
++  phase = Phase::Idle;
++  id.clear();
++  source.clear();
++  target.clear();
++  commitToken.clear();
++  reverse = false;
++}
++void EdgeRoute::closePeer()
++{
++  edgeinput::destinationGate = 0;
++  if (phase == Phase::Entered || phase == Phase::Finishing) {
++    // Remote OLE may still own a drag after the local coordinator disappears.
++    // Keep the next full click out until its watchdog has had time to cancel.
++    id.clear();
++    edgeinput::reverseArmed = 0;
++    phase = Phase::Finishing;
++    deadline = Clock::now() + 2s;
++    edgeinput::finishing = generation;
++  } else reset();
++  candidateGeneration = 0;
++  if (peer >= 0) close(peer);
++  peer = -1;
++  input.clear();
++  output.clear();
++}
++void EdgeRoute::enqueue(const QJsonObject &data)
++{
++  output += QJsonDocument(data).toJson(QJsonDocument::Compact);
++  output += '\n';
++}
++void EdgeRoute::notify(const QString &type, QJsonObject data)
++{
++  data.insert("event", type);
++  data.insert("id", id);
++  data.insert("generation", generation);
++  data.insert("source", source);
++  data.insert("target", target);
++  data.insert("edge", reverse ? "left" : "right");
++  data.insert("seq", ++seq);
++  enqueue(data);
++}
++void EdgeRoute::reject(const QString &requestId, const QString &reason)
++{
++  enqueue({{"event", "rejected"}, {"id", requestId}, {"reason", reason}, {"seq", ++seq}});
++}
++void EdgeRoute::stop(const QString &reason, QJsonObject detail)
++{
++  edgeinput::destinationGate = 0;
++  detail.insert("reason", reason);
++  if (active()) notify("cancelled", detail);
++  if (phase == Phase::Entered) {
++    edgeinput::reverseArmed = 0;
++    phase = Phase::Finishing;
++    edgeinput::finishing = generation;
++    deadline = Clock::now() + 2s;
++    return;
++  }
++  reset();
++}
++void EdgeRoute::targetLost(const std::string &name)
++{
++  if (active() && (source.toStdString() == name || target.toStdString() == name)) stop("target-disconnected");
++}
++void EdgeRoute::command(const QJsonObject &m)
++{
++  QString cmd = m.value("command").toString();
++  QString requestId = m.value("id").toString();
++  if (cmd == "status") {
++    auto state = edgeinput::button.load();
++    auto entry = screens.map();
++    enqueue({{"event","status"},{"seq",++seq},{"onPrimary",screens.onPrimary()},{"held",bool(state & 1)},
++             {"generation",static_cast<qint64>(state >> 1)},{"downSeen",static_cast<qint64>(edgeinput::downSeen.load())},
++             {"dragSeen",static_cast<qint64>(edgeinput::dragSeen.load())},
++             {"acceptedDrags",static_cast<qint64>(edgeinput::acceptedDrags.load())},{"nearRight",entry && entry->fromPrimary && entry->edge - edgeinput::dragX.load() <= 128},
++             {"nearLeft",entry && !entry->fromPrimary && entry->sourceX - entry->edge <= 128},
++             {"screen",QString::fromStdString(screens.current())}});
++    return;
++  }
++  if (cmd == "heartbeat") { heartbeat = Clock::now(); return; }
++  if (cmd == "prepare") {
++    uint64_t state = edgeinput::button.load();
++    auto captured = m.value("observedUptimeMs").toDouble(-1);
++    auto nowMs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000000.0;
++    if (!std::isfinite(captured) || captured < edgeinput::downTimeNs / 1000000.0 ||
++        captured > nowMs + 2 || nowMs - captured > 2000) {
++      reject(requestId, "stale-source-observation");
++      return;
++    }
++    if (m.value("observedGeneration").toInteger(-1) != static_cast<qint64>(state >> 1) ||
++        !candidateGeneration || candidateGeneration != static_cast<qint64>(state >> 1)) {
++      reject(requestId, "stale-source-generation");
++      return;
++    }
++    if (active() || QUuid::fromString(requestId).isNull() ||
++        !(state & 1) || edgeinput::suppressedPress || static_cast<qint64>(state >> 1) <= lastPrepared) {
++      reject(requestId, "invalid-or-unavailable-gesture");
++      return;
++    }
++    auto entry = screens.map();
++    // The original forward protocol identified the primary implicitly. A
++    // secondary source must always identify itself and the primary destination.
++    QString offeredSource = m.value("source").toString();
++    if (!entry || (offeredSource.isEmpty() ? !entry->fromPrimary : offeredSource != entry->source) ||
++        entry->source != candidateSource || entry->target != candidateTarget ||
++        m.value("target").toString() != entry->target || m.value("edge").toString() != candidateEdge ||
++        (entry->fromPrimary ? entry->edge - edgeinput::dragX.load() : entry->sourceX - entry->edge) > 128) {
++      reject(requestId, "source-or-target-unavailable");
++      return;
++    }
++    reverse = !entry->fromPrimary;
++    source = entry->source;
++    target = entry->target;
++    if (!reverse) edgeinput::boundary = entry->edge;
++    generation = static_cast<qint64>(state >> 1);
++    lastPrepared = generation;
++    tapGeneration = edgeinput::tapFault;
++    edgeinput::leased = generation;
++    id = requestId;
++    phase = Phase::Prepared;
++    deadline = Clock::now() + 5s;
++    notify("prepared");
++    return;
++  }
++  if (!active() || requestId != id || m.value("generation").toInteger(-1) != generation) {
++    reject(requestId, "stale-session");
++    return;
++  }
++  if (cmd == "target-ended" && reverse) { verifyTargetEnd(m); return; }
++  if (cmd == "finish" && phase == Phase::Finishing) {
++    notify("finished");
++    reset();
++    return;
++  }
++  if (cmd == "cancel" && phase == Phase::Finishing) return;
++  if (cmd == "cancel") { stop("coordinator-cancelled"); return; }
++  if (cmd == "ready" && phase == Phase::Prepared) {
++    baseline = reverse ? leftOutward : edgeinput::outward.load();
++    phase = Phase::Ready;
++    deadline = Clock::now() + 30s;
++    notify("ready");
++    return;
++  }
++  if (cmd == "destination-start" && reverse && phase == Phase::Entered) {
++    const auto gen = static_cast<uint64_t>(generation);
++    const auto pid = m.value("pid").toInteger(-1);
++    const auto window = m.value("window").toInteger(-1);
++    if (!screens.onPrimary() || !edgeinput::destinationTapReady || edgeinput::button != gen * 2 + 1 ||
++        edgeinput::escaped == gen || edgeinput::destinationGen == gen ||
++        pid <= 0 || pid > INT32_MAX || window <= 0 || window > UINT32_MAX ||
++        !m.value("physicalDownEventNumber").isDouble() ||
++        m.value("physicalDownEventNumber").toInteger(INT64_MIN) != physicalDownEventNumber) {
++      reject(requestId, "destination-start-unavailable"); return;
++    }
++    const auto nonce = (uint64_t{edgeinput::destinationMarker} << 32) | QRandomGenerator::system()->generate();
++    const auto expires = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) + 300000000ULL;
++    edgeinput::destinationPid = pid;
++    edgeinput::destinationWindow = window;
++    edgeinput::destinationExpiry = expires;
++    edgeinput::destinationGen = gen;
++    edgeinput::destinationGate = nonce;
++    notify("destination-start-permitted", {{"pid",pid},{"window",window},{"nonce",QString::number(nonce,16)},
++           {"expiresUptimeMs",expires / 1.e6},{"physicalDownEventNumber",physicalDownEventNumber}});
++    return;
++  }
++  if (cmd == "target-started" && phase == Phase::Entered && reverse) {
++    if (!screens.onPrimary() || edgeinput::button != static_cast<uint64_t>(generation * 2 + 1)) {
++      stop("released-before-target-start"); return;
++    }
++    if (edgeinput::destinationAccepted != static_cast<uint64_t>(generation)) {
++      stop("destination-down-unverified"); return;
++    }
++    if (edgeinput::reverseArmed != static_cast<uint64_t>(generation)) {
++      edgeinput::reverseMoves = 0;
++      edgeinput::reverseDrags = 0;
++      edgeinput::reverseArmed = generation;
++    }
++    notify("target-armed");
++    return;
++  }
++  if (cmd == "source-accepted" && phase == Phase::Committing) {
++    auto entry = screens.map();
++    bool accepted = reverse ? !commitToken.isEmpty() && m.value("commitToken").toString() == commitToken
++                            : edgeinput::consumed == static_cast<uint64_t>(generation);
++    if (!accepted || !entry || !sameRoute(*entry) || !stillAt(*entry)) {
++      stop("source-or-edge-unverified");
++      return;
++    }
++    physicalDownEventNumber = reverse ? edgeinput::downNumber.load() : 0;
++    if (edgeinput::button != static_cast<uint64_t>(generation * 2 + 1) ||
++        edgeinput::escaped == static_cast<uint64_t>(generation)) { stop("gesture-ended-before-switch"); return; }
++    if (reverse) edgeinput::reverseOwned = generation;
++    if (!screens.enter(target.toStdString(), *entry)) { stop("switch-failed"); return; }
++    phase = Phase::Entered;
++    deadline = Clock::now() + 2s;
++    QJsonObject entered{{"x", entry->x}, {"y", entry->y}, {"target", target}};
++    if (reverse) entered.insert("physicalDownEventNumber", physicalDownEventNumber);
++    notify("entered", entered);
++    return;
++  }
++  reject(requestId, "unexpected-command");
++}
++void EdgeRoute::verifyTargetEnd(const QJsonObject &message)
++{
++  const auto gen = static_cast<uint64_t>(generation);
++  const auto now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1.e6;
++  const auto native = message.value("nativeEndedUptimeMs").toDouble(-1);
++  // The release may already have been delivered by Quartz while the server's
++  // periodic progress() has not emitted its "ended" notification yet.
++  const bool delivered = edgeinput::reverseDelivered.load() == gen;
++  const auto physical = delivered ? edgeinput::reverseUpTimeNs.load() / 1.e6 : 0.0;
++  QString error;
++  if ((phase != Phase::Entered && phase != Phase::Finishing) || edgeinput::reverseArmed != gen)
++    error = "native-end-without-armed-target";
++  else if (!delivered)
++    error = "native-ended-before-physical-up";
++  else if (!std::isfinite(native) || native <= 0 || native > now || now - native > 2000 ||
++           physical <= 0 || physical > now || now - physical > 2000)
++    error = "invalid-native-end-timestamp";
++  else if (native < physical)
++    error = "native-ended-before-physical-up";
++  if (!error.isEmpty()) {
++    edgeinput::reverseArmed = 0;
++    if (phase == Phase::Finishing) {
++      // Preserve the existing click quarantine until cleanup is acknowledged.
++      notify("cancelled", {{"reason",error}});
++    } else stop(error);
++    return;
++  }
++  notify("target-ended-verified", {{"physicalUpUptimeMs",physical},{"nativeEndedUptimeMs",native}});
++}
++void EdgeRoute::progress()
++{
++  if (!active()) return;
++  auto gen = static_cast<uint64_t>(generation);
++  if (phase == Phase::Finishing) {
++    if (Clock::now() >= deadline) stop("finish-timeout");
++    return;
++  }
++  if (edgeinput::tapFault != tapGeneration) { stop("event-tap-interrupted"); return; }
++  if (edgeinput::destinationHidRejected == gen) {
++    stop("destination-down-hid-rejected", {{"sourcePid",qint64(edgeinput::observedSourcePid.load())},
++         {"eventNumber",qint64(edgeinput::observedNumber.load())}});
++    return;
++  }
++  if (edgeinput::destinationRejected == gen) {
++    stop("destination-window-mismatch", {{"sourcePid",qint64(edgeinput::observedSourcePid.load())},
++         {"targetPid",qint64(edgeinput::observedTargetPid.load())},
++         {"targetWindow",qint64(edgeinput::observedTargetWindow.load())}});
++    return;
++  }
++  if (edgeinput::escaped == gen) { stop("escape"); return; }
++  if (edgeinput::button != gen * 2 + 1) {
++    if (phase == Phase::Entered) {
++      if (reverse && edgeinput::reverseDelivered != gen) { stop("released-before-target-start"); return; }
++      QJsonObject ended{{"reason", "released"}};
++      if (reverse) {
++        ended.insert("physicalUpUptimeMs", edgeinput::reverseUpTimeNs.load() / 1.e6);
++        const qint64 upNumber = edgeinput::reverseUpNumber.load();
++        ended.insert("physicalDownEventNumber", physicalDownEventNumber);
++        ended.insert("physicalUpEventNumber", upNumber);
++        QString pairing = "unavailable";
++        if (physicalDownEventNumber != 0 && upNumber != 0)
++          pairing = physicalDownEventNumber == upNumber ? "matched" : "mismatched";
++        ended.insert("physicalEventNumberPair", pairing);
++        ended.insert("physicalUpRawEventTimestamp", QString::number(edgeinput::reverseRawUpStamp.load()));
++        ended.insert("physicalUpQuartzX", edgeinput::reverseUpQuartzX.load());
++        ended.insert("physicalUpQuartzY", edgeinput::reverseUpQuartzY.load());
++        ended.insert("primaryMouseMoved", static_cast<qint64>(edgeinput::reverseMoves.load()));
++        ended.insert("primaryLeftDragged", static_cast<qint64>(edgeinput::reverseDrags.load()));
++      }
++      notify("ended", ended);
++      phase = Phase::Finishing;
++      deadline = Clock::now() + 2s;
++    } else stop("released-before-entry");
++    return;
++  }
++  if (Clock::now() - heartbeat > 2s) { stop("heartbeat-expired"); return; }
++  if (phase != Phase::Entered && Clock::now() >= deadline) { stop("prepare-timeout"); return; }
++  if (phase == Phase::Entered) {
++    if (screens.current() != target.toStdString()) stop("target-left");
++    else if (reverse && edgeinput::reverseArmed != gen && Clock::now() >= deadline) stop("target-start-timeout");
++    return;
++  }
++  auto entry = screens.map();
++  if (!entry || !sameRoute(*entry)) { stop("source-left"); return; }
++  bool atEdge = stillAt(*entry);
++  if (phase == Phase::Committing && !atEdge) { stop("edge-left"); return; }
++  if (phase != Phase::Ready || !atEdge || (reverse ? leftOutward : edgeinput::outward.load()) == baseline) return;
++  phase = Phase::Committing;
++  deadline = Clock::now() + 2s;
++  if (reverse) {
++    commitToken = QUuid::createUuid().toString(QUuid::WithoutBraces);
++    notify("commit", {{"commitToken",commitToken}});
++  } else {
++    edgeinput::permit = gen;
++    notify("commit");
++  }
++}
++bool EdgeRoute::sameRoute(const Entry &entry) const
++{
++  return entry.fromPrimary != reverse && entry.source == source && entry.target == target;
++}
++bool EdgeRoute::stillAt(const Entry &entry) const
++{
++  return entry.fromPrimary ? edgeinput::atBoundary.load() : entry.sourceX <= entry.edge;
++}
++void EdgeRoute::secondaryMotion(int x, int leftEdge, int dx)
++{
++  // Called by the normal Deskflow motion queue after applying the raw delta
++  // to the secondary's virtual pointer and before clamping it to the screen.
++  if (reverse && phase == Phase::Ready && dx < 0 && x <= leftEdge) ++leftOutward;
++}
++void EdgeRoute::candidate()
++{
++  auto state = edgeinput::button.load();
++  auto gen = static_cast<qint64>(state >> 1);
++  const auto now = Clock::now();
++  bool eligible = (state & 1) && now - heartbeat < 2s && !edgeinput::suppressedPress &&
++                  gen != 0 && edgeinput::draggedGeneration == static_cast<uint64_t>(gen) &&
++                  edgeinput::escaped != static_cast<uint64_t>(gen) &&
++                  (phase == Phase::Prepared || phase == Phase::Ready || phase == Phase::Committing ||
++                   (phase == Phase::Idle && lastPrepared != gen && !edgeinput::tookSourceLeft()));
++  auto entry = eligible ? screens.map() : std::nullopt;
++  if (entry) {
++    int distance = entry->fromPrimary ? entry->edge - edgeinput::dragX.load() : entry->sourceX - entry->edge;
++    if (distance < 0 || distance > 128) entry.reset();
++  }
++  if (candidateGeneration && (!entry || candidateGeneration != gen || candidateSource != entry->source ||
++                              candidateTarget != entry->target)) {
++    enqueue({{"event","candidate-ended"},{"generation",candidateGeneration},{"seq",++seq},
++             {"source",candidateSource},{"target",candidateTarget},{"edge",candidateEdge}});
++    candidateGeneration = 0;
++  }
++  if (!entry || (candidateGeneration == gen && now < nextCandidate)) return;
++  candidateGeneration = gen;
++  candidateSource = entry->source;
++  candidateTarget = entry->target;
++  candidateEdge = entry->fromPrimary ? "right" : "left";
++  nextCandidate = now + 100ms;
++  enqueue({{"event","candidate"},{"generation",gen},{"held",true},{"leaseMs",300},{"seq",++seq},
++           {"source",candidateSource},{"target",candidateTarget},{"edge",candidateEdge},
++           {"observedUptimeMs",clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000000.0}});
++}
++void EdgeRoute::poll()
++{
++  if (id.isEmpty() && phase == Phase::Finishing && Clock::now() >= deadline) reset();
++  if (peer < 0) {
++    int fd = accept(listener, nullptr, nullptr);
++    if (fd < 0) return;
++    uid_t uid;
++    gid_t gid;
++    int one = 1;
++    if (!configure(fd) || getpeereid(fd, &uid, &gid) || uid != geteuid() ||
++        setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one))) { close(fd); return; }
++    peer = fd;
++    heartbeat = Clock::now();
++  }
++  char chunk[4096];
++  auto n = recv(peer, chunk, sizeof(chunk), 0);
++  if (n == 0 || (n < 0 && !temporary())) { closePeer(); return; }
++  if (n > 0) input.append(chunk, n);
++  if (input.size() > 16384 || output.size() > 16384) { closePeer(); return; }
++  progress();
++  for (int lines = 0; lines < 20; ++lines) {
++    auto split = input.indexOf('\n');
++    if (split < 0) break;
++    auto doc = QJsonDocument::fromJson(input.left(split));
++    input.remove(0, split + 1);
++    if (!doc.isObject()) { closePeer(); return; }
++    command(doc.object());
++    progress();
++  }
++  candidate();
++  if (!output.isEmpty()) {
++    auto sent = send(peer, output.constData(), output.size(), 0);
++    if (sent > 0) output.remove(0, sent);
++    else if (sent == 0 || !temporary()) closePeer();
++  }
++}
+--- /dev/null
++++ b/src/lib/server/EdgeRoute.h
+@@ -0,0 +1,64 @@
++// SPDX-License-Identifier: GPL-2.0-only WITH LicenseRef-OpenSSL-Exception
++#pragma once
++#include <QByteArray>
++#include <QJsonObject>
++#include <QString>
++#include <chrono>
++#include <functional>
++#include <optional>
++#include <string>
++#include <sys/types.h>
++
++class EdgeRoute
++{
++public:
++  struct Entry {
++    int edge, x, y, sourceX;
++    bool fromPrimary;
++    QString source, target;
++  };
++  struct Screens {
++    std::function<std::optional<Entry>()> map;
++    std::function<bool(const std::string &, const Entry &)> enter;
++    std::function<bool()> onPrimary;
++    std::function<std::string()> current;
++  };
++  explicit EdgeRoute(Screens screens);
++  ~EdgeRoute();
++  bool listening() const { return listener >= 0; }
++  bool active() const { return phase != Phase::Idle; }
++  void poll();
++  void secondaryMotion(int x, int leftEdge, int dx);
++  void targetLost(const std::string &name);
++  void stop(const QString &reason, QJsonObject detail = {});
++private:
++  using Clock = std::chrono::steady_clock;
++  enum class Phase { Idle, Prepared, Ready, Committing, Entered, Finishing };
++  void command(const QJsonObject &);
++  void verifyTargetEnd(const QJsonObject &);
++  void progress();
++  void candidate();
++  bool stillAt(const Entry &) const;
++  bool sameRoute(const Entry &) const;
++  void notify(const QString &, QJsonObject = {});
++  void reject(const QString &, const QString &);
++  void enqueue(const QJsonObject &);
++  void closePeer();
++  void reset();
++  Screens screens;
++  int listener = -1, peer = -1;
++  std::string socketPath;
++  dev_t socketDevice{};
++  ino_t socketInode{};
++  QByteArray input, output;
++  QString id, source, target, commitToken;
++  bool reverse = false;
++  Phase phase = Phase::Idle;
++  qint64 generation = 0, lastPrepared = 0, seq = 0;
++  uint64_t baseline = 0, tapGeneration = 0;
++  qint64 candidateGeneration = 0;
++  qint64 physicalDownEventNumber = 0;
++  uint64_t leftOutward = 0;
++  QString candidateSource, candidateTarget, candidateEdge;
++  Clock::time_point heartbeat, deadline, nextCandidate;
++};
+--- a/src/unittests/server/CMakeLists.txt
++++ b/src/unittests/server/CMakeLists.txt
+@@ -28,3 +28,20 @@
+   SOURCE ClientProxyTests.cpp
+   WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/src/lib/server"
+ )
++
++if(APPLE)
++  add_executable(EdgeRouteInputTests EdgeRouteInputTests.cpp)
++  target_include_directories(EdgeRouteInputTests PRIVATE "${CMAKE_SOURCE_DIR}/src/lib")
++  add_test(NAME EdgeRouteInputTests COMMAND EdgeRouteInputTests)
++  add_executable(EdgeRouteEndTimestampTests EdgeRouteEndTimestampTests.cpp)
++  target_include_directories(EdgeRouteEndTimestampTests PRIVATE "${CMAKE_SOURCE_DIR}/src/lib")
++  add_test(NAME EdgeRouteEndTimestampTests COMMAND EdgeRouteEndTimestampTests)
++  set_tests_properties(EdgeRouteEndTimestampTests PROPERTIES TIMEOUT 10)
++  add_executable(EdgeRouteSocketTests EdgeRouteSocketTests.cpp)
++  target_link_libraries(EdgeRouteSocketTests PRIVATE server Qt6::Core)
++  add_test(NAME EdgeRouteSocketTests COMMAND EdgeRouteSocketTests)
++  add_executable(EdgeRouteSocketLifecycleTests EdgeRouteSocketLifecycleTests.cpp)
++  target_link_libraries(EdgeRouteSocketLifecycleTests PRIVATE server Qt6::Core)
++  add_test(NAME EdgeRouteSocketLifecycleTests COMMAND EdgeRouteSocketLifecycleTests)
++  set_tests_properties(EdgeRouteSocketLifecycleTests PROPERTIES TIMEOUT 10)
++endif()
+--- /dev/null
++++ b/src/unittests/server/EdgeRouteInputTests.cpp
+@@ -0,0 +1,47 @@
++// SPDX-License-Identifier: GPL-2.0-only WITH LicenseRef-OpenSSL-Exception
++#include "deskflow/EdgeRouteInput.h"
++#include <cstdio>
++
++// No event tap, display, network or synthesized input is used by this executable.
++#define CHECK(value) do { if (!(value)) { std::fprintf(stderr, "failure at line %d\n", __LINE__); return 1; } } while (false)
++int main()
++{
++  using namespace edgeinput;
++  boundary = 999;
++  CHECK(!down(100));
++  CHECK(!down(101) && button == 3 && downTimeNs == 100);
++  leased = 1;
++  motion(998, 2);
++  CHECK(!atBoundary && outward == 0);
++  motion(999, 1);
++  CHECK(atBoundary && outward == 1);
++  permit = 1;
++  CHECK(!acceptMarker(2, 999));
++  CHECK(!acceptMarker(1, 998));
++  CHECK(acceptMarker(1, 999) && button == 3);
++  CHECK(!acceptMarker(1, 999));
++  CHECK(up() && finishing && button == 2);
++  CHECK(down(300));
++  finishing = false;
++  CHECK(up()); // consume both halves of the click that started during cleanup
++  leased = 0;
++  CHECK(!down(400) && button == 7);
++  CHECK(!up());
++  CHECK(!down(500));
++  leased = 4;
++  permit = 4;
++  motion(999, 3);
++  CHECK(!escape()); // original Finder drag still gets Escape
++  CHECK(!acceptMarker(4, 999));
++  CHECK(!up());
++  CHECK(!down(600));
++  leased = 5;
++  permit = 5;
++  motion(999, 1);
++  CHECK(acceptMarker(5, 999));
++  CHECK(escape() && consumeEscapeUp);
++  leased = 0; // disconnected during the consumed drag
++  CHECK(up() && !finishing);
++  CHECK(!down(700) && !up());
++  std::puts("PASS: physical generations, marker bounds/replay, early Escape, release drain and disconnect");
++}
+--- /dev/null
++++ b/src/unittests/server/EdgeRouteEndTimestampTests.cpp
+@@ -0,0 +1,36 @@
++// SPDX-License-Identifier: GPL-2.0-only WITH LicenseRef-OpenSSL-Exception
++#include "deskflow/EdgeRouteInput.h"
++#include <cstdio>
++#include <semaphore>
++#include <thread>
++
++// Exercise the HID writer / Deskflow reader independently. Once the reader
++// sees "released", the generation and original release time must be visible.
++int main()
++{
++  std::binary_semaphore armed(0), observed(0);
++  constexpr uint64_t rounds = 2000;
++  bool writerOK = true, readerOK = true;
++  std::thread hid([&] {
++    for (uint64_t gen = 1; gen <= rounds; ++gen) {
++      edgeinput::finishing = 0;
++      edgeinput::leased = 0;
++      if (edgeinput::down(gen * 1000)) writerOK = false;
++      edgeinput::leased = gen;
++      edgeinput::reverseOwned = gen;
++      edgeinput::reverseArmed = gen;
++      armed.release();
++      if (edgeinput::up(true, gen * 1000 + 300)) writerOK = false;
++      observed.acquire();
++    }
++  });
++  for (uint64_t gen = 1; gen <= rounds; ++gen) {
++    armed.acquire();
++    while ((edgeinput::button.load() & 1) != 0) std::this_thread::yield();
++    if (edgeinput::reverseDelivered != gen || edgeinput::reverseUpTimeNs != gen * 1000 + 300) readerOK = false;
++    observed.release();
++  }
++  hid.join();
++  if (!writerOK || !readerOK) return 1;
++  std::puts("PASS: released state publishes the matching HID generation and nanosecond timestamp");
++}
+--- /dev/null
++++ b/src/unittests/server/EdgeRouteSocketTests.cpp
+@@ -0,0 +1,305 @@
++// SPDX-License-Identifier: GPL-2.0-only WITH LicenseRef-OpenSSL-Exception
++#include "deskflow/EdgeRouteInput.h"
++#include "server/EdgeRoute.h"
++
++#include <QJsonDocument>
++#include <QTemporaryDir>
++#include <QUuid>
++#include <cstring>
++#include <sys/socket.h>
++#include <sys/un.h>
++#include <time.h>
++#include <unistd.h>
++
++// Drive the actual local socket and route machine with virtual screens and
++// in-memory physical input. No Deskflow instance, event tap or UI is started.
++#define CHECK(value) do { if (!(value)) { std::fprintf(stderr, "failure at line %d\n", __LINE__); return 1; } } while (false)
++int main()
++{
++  QTemporaryDir dir("/tmp/df-route-test-XXXXXX");
++  CHECK(dir.isValid());
++  auto path = (dir.path() + "/ipc").toUtf8();
++  unsetenv("EDGEBRIDGE_ROUTE_SOCKET");
++  { EdgeRoute off({}); CHECK(!off.listening() && !off.active() && !edgeinput::enabled); }
++  setenv("EDGEBRIDGE_ROUTE_SOCKET", path.constData(), 1);
++  std::string current = "mac";
++  int winX = 500;
++  uint64_t releaseDuringProgress = 0;
++  EdgeRoute route({
++    [&]() -> std::optional<EdgeRoute::Entry> {
++      if (current == "mac") return EdgeRoute::Entry{999, 0, 20, 999, true, "mac", "win"};
++      return EdgeRoute::Entry{0, 998, 20, winX, false, "win", "mac"};
++    },
++    [&](const std::string &name, const EdgeRoute::Entry &) { current = name; return true; },
++    [&] { return current == "mac"; }, [&] {
++      // A real HID up can occur between progress() and command processing.
++      if (releaseDuringProgress) {
++        edgeinput::up(true, releaseDuringProgress);
++        releaseDuringProgress = 0;
++      }
++      return current;
++    }
++  });
++  CHECK(route.listening());
++  int fd = socket(AF_UNIX, SOCK_STREAM, 0);
++  sockaddr_un addr{};
++  addr.sun_family = AF_UNIX;
++  std::strcpy(addr.sun_path, path.constData());
++  CHECK(connect(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) == 0);
++  QList<QJsonObject> hints, replies;
++  auto step = [&](const QJsonObject &cmd = {}) -> QJsonObject {
++    if (!cmd.isEmpty()) {
++      auto line = QJsonDocument(cmd).toJson(QJsonDocument::Compact) + '\n';
++      if (send(fd, line.constData(), line.size(), 0) != line.size()) return {};
++    }
++    route.poll();
++    char buf[4096];
++    auto n = recv(fd, buf, sizeof(buf), MSG_DONTWAIT);
++    QJsonObject reply;
++    if (n <= 0) return reply;
++    for (auto line : QByteArray(buf, n).split('\n')) {
++      if (line.isEmpty()) continue;
++      auto message = QJsonDocument::fromJson(line).object();
++      auto type = message["event"].toString();
++      if (type == "candidate" || type == "candidate-ended") hints.append(message);
++      else { reply = message; replies.append(message); }
++    }
++    return reply;
++  };
++  auto id = QUuid::createUuid().toString(QUuid::WithoutBraces);
++  auto t = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
++  QJsonObject prepare{{"command","prepare"},{"id",id},{"edge","right"},{"target","win"},{"observedGeneration",1},{"observedUptimeMs",t/1.e6}};
++  auto command = [&](const char *cmd, int generation) {
++    return QJsonObject{{"command",cmd},{"id",id},{"generation",generation}};
++  };
++  CHECK(step(prepare)["event"] == "rejected");
++  edgeinput::down(t, 700, 0);
++  step();
++  CHECK(hints.isEmpty()); // ordinary press does not arm the strip
++  edgeinput::leftDrag(710, 0, 10, 0);
++  step();
++  CHECK(hints.isEmpty()); // far from the edge
++  edgeinput::leftDrag(940, 0, 10, 0);
++  step();
++  CHECK(hints.size() == 1 && hints.back()["event"] == "candidate" && hints.back()["generation"] == 1);
++  edgeinput::leftDrag(800, 0, -20, 0);
++  step();
++  CHECK(hints.back()["event"] == "candidate-ended");
++  edgeinput::leftDrag(995, 0, 10, 0);
++  step();
++  CHECK(hints.back()["event"] == "candidate");
++  CHECK(step({{"command","status"}})["acceptedDrags"].toInt() >= 3);
++  prepare.insert("observedGeneration",2);
++  CHECK(step(prepare)["reason"] == "stale-source-generation");
++  prepare.insert("observedGeneration",1);
++  CHECK(step(prepare)["event"] == "prepared");
++  edgeinput::motion(999, 1); // before ready, cannot trigger commit
++  CHECK(step(command("ready", 1))["event"] == "ready");
++  CHECK(step().isEmpty());
++  edgeinput::motion(999, 2);
++  CHECK(step()["event"] == "commit");
++  CHECK(current == "mac");
++  CHECK(edgeinput::acceptMarker(1,999));
++  auto count = hints.size();
++  usleep(110000);
++  step();
++  CHECK(hints.size() == count + 1 && hints.back()["event"] == "candidate");
++  CHECK(step(command("source-accepted",1))["event"] == "entered" && current == "win");
++  CHECK(hints.back()["event"] == "candidate-ended");
++  CHECK(edgeinput::up());
++  CHECK(step()["event"] == "ended" && route.active());
++  CHECK(edgeinput::down(t+1));
++  CHECK(step(command("finish",1))["event"] == "finished" && !route.active());
++  CHECK(edgeinput::up());
++  current = "mac";
++  t = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
++  CHECK(!edgeinput::down(t));
++  CHECK(step(prepare)["event"] == "rejected"); // request belongs to a previous physical down
++  edgeinput::leftDrag(995, 0, 10, 0);
++  step();
++  prepare.insert("observedGeneration", static_cast<qint64>(edgeinput::button.load() >> 1));
++  prepare.insert("observedUptimeMs",t/1.e6);
++  CHECK(step(prepare)["event"] == "prepared");
++  CHECK(step(command("ready",3))["event"] == "ready");
++  edgeinput::up();
++  CHECK(step()["reason"] == "released-before-entry" && current == "mac");
++  t = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
++  edgeinput::down(t);
++  edgeinput::leftDrag(995, 0, 10, 0);
++  step();
++  prepare.insert("observedGeneration", static_cast<qint64>(edgeinput::button.load() >> 1));
++  prepare.insert("observedUptimeMs",t/1.e6);
++  CHECK(step(prepare)["event"] == "prepared");
++  CHECK(step(command("ready",4))["event"] == "ready");
++  edgeinput::motion(999,2);
++  CHECK(step()["event"] == "commit" && edgeinput::acceptMarker(4,999));
++  CHECK(step(command("source-accepted",4))["event"] == "entered");
++  close(fd);
++  route.poll();
++  CHECK(route.active() && edgeinput::up());
++  CHECK(edgeinput::down(t+1));
++  usleep(2050000);
++  route.poll();
++  CHECK(!route.active() && edgeinput::up()); // release paired after disconnect grace
++  CHECK(!edgeinput::down(t+2) && !edgeinput::up());
++  fd = socket(AF_UNIX, SOCK_STREAM, 0);
++  CHECK(connect(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) == 0);
++  edgeinput::destinationTapReady = true; // virtual annotated tap
++  enum class Outcome { WrongToken, EarlyUp, WrongPid, WrongNumber, Expired, WrongWindow, CancelAfterHid, EarlyAfterHid, Escape, EarlyNative, LateReport, FutureReport, StalePhysicalClock, Success, RacingUp, Disconnect };
++  for (auto outcome : {Outcome::WrongToken, Outcome::EarlyUp, Outcome::WrongPid, Outcome::WrongNumber, Outcome::Expired, Outcome::WrongWindow, Outcome::CancelAfterHid, Outcome::EarlyAfterHid, Outcome::Escape, Outcome::EarlyNative, Outcome::LateReport,
++                       Outcome::FutureReport, Outcome::StalePhysicalClock, Outcome::Success, Outcome::RacingUp, Outcome::Disconnect}) {
++    current = "win";
++    winX = 500;
++    id = QUuid::createUuid().toString(QUuid::WithoutBraces);
++    t = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
++    // Quartz mouse event numbers can be signed (including a negative wrapped value).
++    const int downNumber = outcome == Outcome::StalePhysicalClock ? 0 : -1234;
++    const int upNumber = outcome == Outcome::FutureReport ? 1235 : downNumber;
++    CHECK(!edgeinput::down(outcome == Outcome::StalePhysicalClock ? t - 10000000000ULL : t, 500, 400, downNumber));
++    auto gen = static_cast<int>(edgeinput::button.load() >> 1);
++    auto n = hints.size();
++    // The primary cursor is frozen. Accumulated small raw movements still
++    // establish a drag; only the Windows virtual pointer can arm its left edge.
++    for (int i = 0; i < 3; ++i) edgeinput::offscreenMotion(-2, 0);
++    step({{"command","heartbeat"}});
++    CHECK(hints.size() == n);
++    winX = 80;
++    step();
++    CHECK(hints.size() == n+1 && hints.back()["source"] == "win" &&
++          hints.back()["target"] == "mac" && hints.back()["edge"] == "left");
++    QJsonObject offer{{"command","prepare"},{"id",id},{"source","win"},{"target","mac"},
++                      {"edge","left"},{"observedGeneration",gen},{"observedUptimeMs",hints.back()["observedUptimeMs"]}};
++    auto wrong = offer;
++    wrong["source"] = "mac";
++    CHECK(step(wrong)["event"] == "rejected");
++    CHECK(step(offer)["event"] == "prepared");
++    winX = 0;
++    route.secondaryMotion(0, 0, -5); // crossing before Ready cannot commit
++    CHECK(step(command("ready",gen))["event"] == "ready");
++    route.secondaryMotion(0, 0, 1);
++    CHECK(step().isEmpty());
++    route.secondaryMotion(-3, 0, -3);
++    auto commit = step();
++    CHECK(commit["event"] == "commit" && commit["edge"] == "left" && !edgeinput::permit);
++    auto accepted = command("source-accepted",gen);
++    accepted["commitToken"] = outcome == Outcome::WrongToken ? QJsonValue("old") : commit["commitToken"];
++    if (outcome == Outcome::WrongToken) {
++      CHECK(step(accepted)["event"] == "cancelled" && current == "win");
++      CHECK(!edgeinput::up(false));
++      continue;
++    }
++    auto entered = step(accepted);
++    CHECK(entered["event"] == "entered" && current == "mac");
++    CHECK(entered["physicalDownEventNumber"].toInteger(-1) == downNumber);
++    if (outcome == Outcome::EarlyUp) {
++      CHECK(edgeinput::up(true)); // no local session may receive this mouse-up
++      CHECK(step()["reason"] == "released-before-target-start");
++      CHECK(step(command("target-started",gen))["event"] == "rejected");
++    } else {
++      auto request = command("destination-start", gen);
++      request["pid"] = 100;
++      request["window"] = 200;
++      request["physicalDownEventNumber"] = downNumber;
++      auto permitted = step(request);
++      CHECK(permitted["event"] == "destination-start-permitted");
++      bool ok = false;
++      auto nonce = permitted["nonce"].toString().toULongLong(&ok,16);
++      CHECK(ok && nonce >> 32 == edgeinput::destinationMarker && permitted["expiresUptimeMs"].toDouble() > t/1.e6);
++      CHECK(step(request)["event"] == "rejected"); // cannot acquire another permit for this press
++      auto now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
++      if (outcome == Outcome::WrongPid || outcome == Outcome::WrongNumber || outcome == Outcome::Expired) {
++        int sourcePid = outcome == Outcome::WrongPid ? 101 : 100;
++        auto observed = outcome == Outcome::WrongNumber ? downNumber+1 : downNumber;
++        auto timestamp = outcome == Outcome::Expired ? now + 500000000ULL : now;
++        CHECK(!edgeinput::admitDestinationDown(nonce,sourcePid,observed,timestamp));
++        CHECK(!edgeinput::admitDestinationDown(nonce,100,downNumber,now)); // cannot retry
++        auto refused = step();
++        CHECK(refused["reason"] == "destination-down-hid-rejected" && refused["sourcePid"] == sourcePid);
++        CHECK(edgeinput::up(true,now) && !edgeinput::destinationDebt);
++        CHECK(step(command("finish",gen))["event"] == "finished");
++        continue;
++      }
++      CHECK(edgeinput::admitDestinationDown(nonce, 100, downNumber, now));
++      CHECK(!edgeinput::admitDestinationDown(nonce, 100, downNumber, now)); // raw replay
++      if (outcome == Outcome::CancelAfterHid || outcome == Outcome::EarlyAfterHid || outcome == Outcome::WrongWindow) {
++        if (outcome == Outcome::CancelAfterHid) {
++          CHECK(step(command("cancel",gen))["event"] == "cancelled");
++          CHECK(!edgeinput::annotateDestinationDown(nonce,100,100,200,now));
++          CHECK(step(command("finish",gen))["event"] == "finished");
++          CHECK(!edgeinput::up(false,now)); // debt outlives lease and even active screen change
++        } else if (outcome == Outcome::WrongWindow) {
++          CHECK(!edgeinput::annotateDestinationDown(nonce,100,100,201,now));
++          CHECK(step()["reason"] == "destination-window-mismatch");
++          CHECK(!edgeinput::up(true,now));
++          CHECK(step(command("finish",gen))["event"] == "finished");
++        } else {
++          CHECK(!edgeinput::up(true,now));
++          CHECK(!edgeinput::annotateDestinationDown(nonce,100,100,200,now));
++          CHECK(step()["event"] == "cancelled");
++          CHECK(step(command("finish",gen))["event"] == "finished");
++        }
++        CHECK(!edgeinput::destinationDebt && edgeinput::reverseDelivered != static_cast<uint64_t>(gen));
++        continue;
++      }
++      CHECK(edgeinput::annotateDestinationDown(nonce,100,100,200,now));
++      CHECK(!edgeinput::annotateDestinationDown(nonce,100,100,200,now));
++      CHECK(step(command("target-started",gen))["event"] == "target-armed");
++      if (outcome == Outcome::Disconnect) {
++        close(fd);
++        route.poll();
++        CHECK(!edgeinput::up(true) && edgeinput::reverseDelivered != static_cast<uint64_t>(gen)); // balance only
++        break;
++      }
++      if (outcome == Outcome::Escape) {
++        CHECK(!edgeinput::escape()); // allow physical Escape into AppKit itself
++        CHECK(step()["reason"] == "escape");
++        CHECK(!edgeinput::up(true) && edgeinput::reverseDelivered != static_cast<uint64_t>(gen)); // balance only
++      } else {
++        QJsonObject native = command("target-ended",gen);
++        uint64_t upTime = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
++        if (outcome == Outcome::StalePhysicalClock) upTime -= 4000000000ULL;
++        double upMs = upTime / 1.e6;
++        native["nativeEndedUptimeMs"] = upMs;
++        auto previousGeneration = native;
++        previousGeneration["generation"] = gen - 1;
++        CHECK(step(previousGeneration)["reason"] == "stale-session" && edgeinput::reverseArmed == gen);
++        if (outcome == Outcome::EarlyNative) {
++          CHECK(step(native)["reason"] == "native-ended-before-physical-up");
++          CHECK(!edgeinput::reverseArmed && !edgeinput::up(true, upTime) && edgeinput::reverseDelivered != static_cast<uint64_t>(gen)); // no later successful release
++        } else if (outcome == Outcome::RacingUp) {
++          releaseDuringProgress = upTime;
++          auto count = replies.size();
++          step(native);
++          CHECK(replies.size() == count+2 && replies[count]["event"] == "target-ended-verified");
++          CHECK(replies[count+1]["event"] == "ended" && replies[count+1]["physicalUpUptimeMs"] == upMs);
++        } else {
++          CHECK(!edgeinput::up(true,upTime,upNumber) && edgeinput::reverseDelivered == static_cast<uint64_t>(gen));
++          auto ended = step();
++          CHECK(ended["event"] == "ended" && ended["physicalUpUptimeMs"] == upMs);
++          CHECK(ended["physicalDownEventNumber"].toInteger(-1) == downNumber);
++          CHECK(ended["physicalUpEventNumber"].toInteger(-1) == upNumber);
++          CHECK(ended["physicalEventNumberPair"] == (!downNumber ? "unavailable" : upNumber == downNumber ? "matched" : "mismatched"));
++          if (outcome == Outcome::Success) {
++            // Subsequent suppressed button edges must not replace the old release timestamp.
++            CHECK(edgeinput::down(upTime+1) && edgeinput::up(true,upTime+2));
++            auto ack = step(native);
++            CHECK(ack["event"] == "target-ended-verified" &&
++                  ack["nativeEndedUptimeMs"] == upMs && ack["physicalUpUptimeMs"] == upMs);
++          } else {
++            bool late = outcome == Outcome::LateReport;
++            if (outcome == Outcome::StalePhysicalClock) {
++              // A fresh native callback cannot validate a release from an old or mismatched clock domain.
++              native["nativeEndedUptimeMs"] = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1.e6;
++            } else native["nativeEndedUptimeMs"] = late ? upMs - 1 : upMs + 5000;
++            CHECK(step(native)["reason"] == (late ? "native-ended-before-physical-up" : "invalid-native-end-timestamp"));
++            CHECK(!edgeinput::reverseArmed);
++          }
++        }
++      }
++    }
++    CHECK(edgeinput::down(t+1));
++    CHECK(step(command("finish",gen))["event"] == "finished");
++    CHECK(edgeinput::up(true)); // whole next click remains paired through cleanup
++  }
++  std::puts("PASS: forward and reverse actual socket, scoped source commit, Mac target arming, release, Esc and EOF");
++}
+--- /dev/null
++++ b/src/unittests/server/EdgeRouteSocketLifecycleTests.cpp
+@@ -0,0 +1,54 @@
++// SPDX-License-Identifier: GPL-2.0-only WITH LicenseRef-OpenSSL-Exception
++#include "server/EdgeRoute.h"
++#include <QTemporaryDir>
++#include <QFile>
++#include <cstdio>
++#include <cstring>
++#include <sys/socket.h>
++#include <sys/stat.h>
++#include <sys/un.h>
++#include <unistd.h>
++
++#define CHECK(value) do { if (!(value)) { std::fprintf(stderr, "failure at line %d\n", __LINE__); return 1; } } while (false)
++int main()
++{
++  QTemporaryDir temp("/tmp/df-route-lifecycle-XXXXXX");
++  CHECK(temp.isValid());
++  auto path = (temp.path() + "/route.sock").toUtf8();
++  setenv("EDGEBRIDGE_ROUTE_SOCKET", path.constData(), 1);
++  sockaddr_un addr{};
++  addr.sun_family = AF_UNIX;
++  std::strcpy(addr.sun_path, path.constData());
++  int original = socket(AF_UNIX, SOCK_STREAM, 0);
++  CHECK(original >= 0 && bind(original, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) == 0);
++  CHECK(listen(original, 1) == 0);
++  struct stat before{}, after{};
++  CHECK(lstat(path, &before) == 0);
++  { EdgeRoute second({}); CHECK(!second.listening()); }
++  CHECK(lstat(path, &after) == 0 && before.st_ino == after.st_ino);
++  int probed = accept(original, nullptr, nullptr);
++  CHECK(probed >= 0); // existing endpoint served a real probe; it survived
++  close(probed);
++  close(original); // stale node, equivalent to abrupt process termination
++  CHECK(lstat(path, &after) == 0 && S_ISSOCK(after.st_mode));
++  {
++    EdgeRoute replacement({});
++    CHECK(replacement.listening());
++    int client = socket(AF_UNIX, SOCK_STREAM, 0);
++    CHECK(connect(client, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) == 0);
++    close(client);
++  }
++  CHECK(lstat(path, &after) != 0 && errno == ENOENT);
++  QFile ordinary(QString::fromUtf8(path));
++  CHECK(ordinary.open(QIODevice::NewOnly | QIODevice::WriteOnly) && ordinary.write("keep") == 4);
++  ordinary.close();
++  { EdgeRoute collision({}); CHECK(!collision.listening()); }
++  CHECK(ordinary.open(QIODevice::ReadOnly) && ordinary.readAll() == "keep");
++  ordinary.close();
++  auto alias = (temp.path() + "/alias.sock").toUtf8();
++  CHECK(symlink(path.constData(), alias.constData()) == 0);
++  setenv("EDGEBRIDGE_ROUTE_SOCKET", alias.constData(), 1);
++  { EdgeRoute symlinkCollision({}); CHECK(!symlinkCollision.listening()); }
++  CHECK(lstat(alias, &after) == 0 && S_ISLNK(after.st_mode));
++  std::puts("PASS: protected active listener, reclaimed refused socket, preserved ordinary file and symlink");
++}
