@@ -30,6 +30,13 @@ git apply "$adapter_root/selectable-screen-layout.patch"
 
 The second patch follows the configured adjacent screen instead of assuming the Mac is on the left. It adds a mirrored run of the existing socket regression; use it with EdgeBridge's corresponding coordinator and native helpers. Its SHA-256 is `2f3cfb433bcc45d20642ba70edb9cad80a3c3151b2a9b92b82b07bbbfa56ba0a`.
 
+For the Windows-to-Windows experiment, apply [same-system-ole-experiment.patch](same-system-ole-experiment.patch) after both patches. It adds the Windows primary input policy and a local named pipe restricted to the current user. The x64 Win32 pipe and input-gate tests passed independently on Windows; the complete Windows core and two-desktop drag and drop have not been validated. Keep the experimental core separate from a working installation.
+
+```sh
+git apply --check "$adapter_root/same-system-ole-experiment.patch"
+git apply "$adapter_root/same-system-ole-experiment.patch"
+```
+
 ## Build on macOS
 
 The verified Apple Silicon build used the Xcode Command Line Tools, CMake 4.5, Ninja 1.13, Qt 6.12 (including Qt Linguist Tools) and OpenSSL 4 from Homebrew. From the patched Deskflow checkout:

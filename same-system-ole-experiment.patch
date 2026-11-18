@@ -1,0 +1,834 @@
+diff --git a/src/lib/deskflow/EdgeRouteInput.h b/src/lib/deskflow/EdgeRouteInput.h
+index 0737872..3c1437c 100644
+--- a/src/lib/deskflow/EdgeRouteInput.h
++++ b/src/lib/deskflow/EdgeRouteInput.h
+@@ -14,6 +14,8 @@ inline std::atomic<uint64_t> downTimeNs{0};
+ inline std::atomic<int64_t> downNumber{0}, reverseUpNumber{0};
+ inline std::atomic<uint64_t> button{0}; // (generation << 1) | held
+ inline std::atomic<uint64_t> permit{0}, consumed{0}, escaped{0}, leased{0};
++inline std::atomic<uint64_t> windowsSourceWindow{0};
++inline std::atomic<uint32_t> windowsCommitTag{0};
+ inline std::atomic<bool> consumeEscapeUp{false}, suppressedPress{false};
+ // A reverse handoff owns the up only after the Windows source acknowledged
+ // its local drop. AppKit receives it after its own willBeginAt callback.
+@@ -26,7 +28,7 @@ inline std::atomic<int> reverseUpQuartzX{0}, reverseUpQuartzY{0};
+ inline std::atomic<unsigned> reverseMoves{0}, reverseDrags{0};
+ inline std::atomic<int> travelX{0}, travelY{0};
+ inline std::atomic<uint64_t> finishing{0}, tapFault{0};
+-inline std::atomic<int> boundary{std::numeric_limits<int>::max()};
++inline std::atomic<int> boundary{(std::numeric_limits<int>::max)()};
+ inline std::atomic<bool> boundaryRight{true};
+ inline std::atomic<uint64_t> outward{0};
+ inline std::atomic<bool> atBoundary{false};
+@@ -166,6 +168,11 @@ inline bool acceptMarker(uint64_t gen, int x)
+   consumed = gen;
+   return true;
+ }
++inline bool acceptWindowsRelease(uint64_t tag, uint64_t window, int x)
++{
++  return static_cast<uint32_t>(tag) == marker && window && window == windowsSourceWindow &&
++         (tag >> 32) == windowsCommitTag && acceptMarker(button.load() >> 1, x);
++}
+ inline bool escape()
+ {
+   auto state = button.load();
+diff --git a/src/lib/platform/MSWindowsComputer.cpp b/src/lib/platform/MSWindowsComputer.cpp
+index 6178517..f1d4cc6 100644
+--- a/src/lib/platform/MSWindowsComputer.cpp
++++ b/src/lib/platform/MSWindowsComputer.cpp
+@@ -7,6 +7,7 @@
+  */
+ 
+ #include "platform/MSWindowsComputer.h"
++#include "deskflow/EdgeRouteInput.h"
+ 
+ #include "arch/Arch.h"
+ #include "arch/win32/ArchMiscWindows.h"
+@@ -673,6 +674,10 @@ bool MSWindowsComputer::isAnyMouseButtonDown(uint32_t &buttonID) const
+                                        "Right Button", "X Button 1",  "X Button 2"};
+ 
+   for (uint32_t i = 1; i < sizeof(m_buttons) / sizeof(m_buttons[0]); ++i) {
++    if (i == kButtonLeft && m_isPrimary && edgeinput::enabled && edgeinput::button.load()) {
++      if (edgeinput::button.load() & 1) { buttonID = kButtonLeft; return true; }
++      continue;
++    }
+     if (m_buttons[i]) {
+       buttonID = i;
+       LOG_DEBUG("locked by \"%s\"", buttonToName[i]);
+@@ -1265,6 +1270,7 @@ bool MSWindowsComputer::onMouseMove(int32_t mx, int32_t my)
+ 
+       LOG_DEBUG("dropped bogus delta motion: %+d,%+d", x, y);
+     } else {
++      if (m_isPrimary && edgeinput::enabled) edgeinput::offscreenMotion(x, y);
+       // send motion
+       sendEvent(EventTypes::PrimaryComputerMotionOnSecondary, MotionInfo::alloc(x, y));
+     }
+diff --git a/src/lib/platform/MSWindowsHook.cpp b/src/lib/platform/MSWindowsHook.cpp
+index 444b3a5..e7dd7ff 100644
+--- a/src/lib/platform/MSWindowsHook.cpp
++++ b/src/lib/platform/MSWindowsHook.cpp
+@@ -9,7 +9,9 @@
+ #include "base/DirectionTypes.h"
+ #include "base/Log.h"
+ #include "deskflow/DisplayException.h"
++#include "deskflow/EdgeRouteInput.h"
+ 
++#include <chrono>
+ #include <cstring>
+ #include <mutex>
+ 
+@@ -42,6 +44,7 @@ static std::mutex g_keyStateMutex;
+ static DWORD g_hookThread = 0;
+ static bool g_fakeServerInput = false;
+ static BOOL g_isPrimary = TRUE;
++static POINT g_physicalCursor{};
+ 
+ MSWindowsHook::~MSWindowsHook()
+ {
+@@ -453,6 +456,11 @@ static LRESULT CALLBACK keyboardLLHook(int code, WPARAM wParam, LPARAM lParam)
+     KBDLLHOOKSTRUCT *info = reinterpret_cast<KBDLLHOOKSTRUCT *>(lParam);
+ 
+     bool const injected = info->flags & LLKHF_INJECTED;
++    if (!injected && g_isPrimary && edgeinput::enabled && info->vkCode == VK_ESCAPE) {
++      if (info->flags & LLKHF_UP) {
++        if (edgeinput::consumeEscapeUp.exchange(false)) return 1;
++      } else if (edgeinput::consumeEscapeUp || edgeinput::escape()) return 1;
++    }
+     if (!g_isPrimary && injected) {
+       return CallNextHookEx(g_keyboardLL, code, wParam, lParam);
+     }
+@@ -600,6 +608,34 @@ static LRESULT CALLBACK mouseLLHook(int code, WPARAM wParam, LPARAM lParam)
+     MSLLHOOKSTRUCT *info = reinterpret_cast<MSLLHOOKSTRUCT *>(lParam);
+ 
+     bool const injected = info->flags & LLMHF_INJECTED;
++    if (edgeinput::enabled && g_isPrimary) {
++      const auto tag = static_cast<uint64_t>(info->dwExtraInfo);
++      const auto x = info->pt.x, y = info->pt.y;
++      if (injected && wParam == WM_LBUTTONUP && static_cast<uint32_t>(tag) == edgeinput::marker) {
++        auto window = reinterpret_cast<uintptr_t>(WindowFromPoint(info->pt));
++        if (g_mode != kHOOK_WATCH_JUMP_ZONE || !edgeinput::acceptWindowsRelease(tag, window, x)) return 1;
++        return CallNextHookEx(g_mouseLL, code, wParam, lParam);
++      }
++      if (!injected) {
++        if (wParam == WM_LBUTTONDOWN || wParam == WM_NCLBUTTONDOWN) {
++          const auto timestamp = std::chrono::duration_cast<std::chrono::nanoseconds>(
++              std::chrono::steady_clock::now().time_since_epoch()).count();
++          g_physicalCursor = info->pt;
++          if (edgeinput::down(timestamp, x, y)) return 1;
++        } else if (wParam == WM_LBUTTONUP || wParam == WM_NCLBUTTONUP) {
++          if (edgeinput::up()) return 1;
++        } else if (wParam == WM_MOUSEMOVE) {
++          if (g_mode == kHOOK_WATCH_JUMP_ZONE) {
++            const int dx = x - g_physicalCursor.x;
++            const int dy = y - g_physicalCursor.y;
++            edgeinput::leftDrag(x, y, dx, dy);
++            const bool pinned = !dx && !dy && x == edgeinput::boundary.load();
++            edgeinput::motion(x, pinned ? (edgeinput::boundaryRight.load() ? 1 : -1) : dx);
++          }
++          g_physicalCursor = info->pt;
++        }
++      }
++    }
+     if (!g_isPrimary && injected) {
+       return CallNextHookEx(g_mouseLL, code, wParam, lParam);
+     }
+diff --git a/src/lib/server/CMakeLists.txt b/src/lib/server/CMakeLists.txt
+index 7d70b43..ea16bdc 100644
+--- a/src/lib/server/CMakeLists.txt
++++ b/src/lib/server/CMakeLists.txt
+@@ -40,9 +40,13 @@ add_library(server STATIC
+   Server.h
+ )
+ 
+-if(APPLE)
++if(APPLE OR WIN32)
+   target_sources(server PRIVATE EdgeRoute.cpp EdgeRoute.h)
+ endif()
++if(WIN32)
++  target_sources(server PRIVATE WinRoutePipe.h)
++  target_link_libraries(server PRIVATE advapi32)
++endif()
+ 
+ target_link_libraries(server PUBLIC common)
+ 
+diff --git a/src/lib/server/EdgeRoute.cpp b/src/lib/server/EdgeRoute.cpp
+index 78f131e..cb19eee 100644
+--- a/src/lib/server/EdgeRoute.cpp
++++ b/src/lib/server/EdgeRoute.cpp
+@@ -7,11 +7,12 @@
+ #include <QUuid>
+ #include <QScopeGuard>
+ #include <QRandomGenerator>
++#include <QRegularExpression>
+ #include <cerrno>
+ #include <cmath>
+ #include <cstdlib>
+-#include <time.h>
+ #include <cstring>
++#ifndef _WIN32
+ #include <fcntl.h>
+ #include <filesystem>
+ #include <sys/file.h>
+@@ -19,9 +20,21 @@
+ #include <sys/stat.h>
+ #include <sys/un.h>
+ #include <unistd.h>
++#include <time.h>
++#endif
+ 
+ using namespace std::chrono_literals;
+ namespace {
++uint64_t uptimeNs()
++{
++#ifdef _WIN32
++  return std::chrono::duration_cast<std::chrono::nanoseconds>(
++      std::chrono::steady_clock::now().time_since_epoch()).count();
++#else
++  return clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
++#endif
++}
++#ifndef _WIN32
+ bool configure(int fd)
+ {
+   return fcntl(fd, F_SETFL, O_NONBLOCK) == 0 && fcntl(fd, F_SETFD, FD_CLOEXEC) == 0;
+@@ -47,6 +60,7 @@ bool reclaimRefusedSocket(const sockaddr_un &addr)
+   return unlink(addr.sun_path) == 0;
+ }
+ bool temporary() { return errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR; }
++#endif
+ int edgeDistance(const EdgeRoute::Entry &entry)
+ {
+   const int x = entry.fromPrimary ? edgeinput::dragX.load() : entry.sourceX;
+@@ -58,6 +72,13 @@ EdgeRoute::EdgeRoute(Screens s) : screens(std::move(s))
+ {
+   auto setting = std::getenv("EDGEBRIDGE_ROUTE_SOCKET");
+   if (!setting || !*setting) return;
++#ifdef _WIN32
++  const auto name = QString::fromLocal8Bit(setting);
++  const auto prefix = QStringLiteral("\\\\.\\pipe\\");
++  static const QRegularExpression allowed(QStringLiteral("^edgebridge-[a-zA-Z0-9_-]{1,64}$"));
++  if (!name.startsWith(prefix) || !allowed.match(name.mid(prefix.size())).hasMatch()) return;
++  if (!windowsPipe.listen(name.toStdWString().c_str())) return;
++#else
+   const std::filesystem::path path(setting);
+   struct stat st{};
+   sockaddr_un addr{};
+@@ -103,20 +124,33 @@ EdgeRoute::EdgeRoute(Screens s) : screens(std::move(s))
+   closeFailed.dismiss();
+   listener = fd;
+   socketPath = path.string();
++#endif
+   edgeinput::enabled = true;
+ }
++bool EdgeRoute::listening() const
++{
++#ifdef _WIN32
++  return windowsPipe.listening();
++#else
++  return listener >= 0;
++#endif
++}
+ EdgeRoute::~EdgeRoute()
+ {
+-  if (listener < 0) return;
++  if (!listening()) return;
+   closePeer();
+   reset();
+   edgeinput::enabled = false;
++#ifndef _WIN32
+   if (sameOwnedSocket(socketPath.c_str(), socketDevice, socketInode)) unlink(socketPath.c_str());
+   close(listener);
++#endif
+ }
+ void EdgeRoute::reset()
+ {
+   edgeinput::permit = 0;
++  edgeinput::windowsSourceWindow = 0;
++  edgeinput::windowsCommitTag = 0;
+   edgeinput::destinationGate = 0;
+   edgeinput::reverseArmed = 0;
+   edgeinput::leased = 0;
+@@ -141,8 +175,13 @@ void EdgeRoute::closePeer()
+     edgeinput::finishing = generation;
+   } else reset();
+   candidateGeneration = 0;
++#ifdef _WIN32
++  windowsPipe.disconnect();
++  windowsPeer = false;
++#else
+   if (peer >= 0) close(peer);
+   peer = -1;
++#endif
+   input.clear();
+   output.clear();
+ }
+@@ -203,7 +242,7 @@ void EdgeRoute::command(const QJsonObject &m)
+   if (cmd == "prepare") {
+     uint64_t state = edgeinput::button.load();
+     auto captured = m.value("observedUptimeMs").toDouble(-1);
+-    auto nowMs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000000.0;
++    auto nowMs = uptimeNs() / 1000000.0;
+     if (!std::isfinite(captured) || captured < edgeinput::downTimeNs / 1000000.0 ||
+         captured > nowMs + 2 || nowMs - captured > 2000) {
+       reject(requestId, "stale-source-observation");
+@@ -238,6 +277,15 @@ void EdgeRoute::command(const QJsonObject &m)
+       edgeinput::atBoundary = false;
+       edgeinput::boundary = entry->edge;
+       edgeinput::boundaryRight = edgeRight;
++      if (screens.primaryOle) {
++        bool ok = false;
++        const auto window = m.value("sourceWindow").toString().toULongLong(&ok, 10);
++        if (!ok || !window) {
++          reject(requestId, "missing-ole-source-window");
++          return;
++        }
++        edgeinput::windowsSourceWindow = window;
++      }
+     }
+     generation = static_cast<qint64>(state >> 1);
+     lastPrepared = generation;
+@@ -253,7 +301,7 @@ void EdgeRoute::command(const QJsonObject &m)
+     reject(requestId, "stale-session");
+     return;
+   }
+-  if (cmd == "target-ended" && reverse) { verifyTargetEnd(m); return; }
++  if (cmd == "target-ended" && localAppKitTarget()) { verifyTargetEnd(m); return; }
+   if (cmd == "finish" && phase == Phase::Finishing) {
+     notify("finished");
+     reset();
+@@ -268,7 +316,7 @@ void EdgeRoute::command(const QJsonObject &m)
+     notify("ready");
+     return;
+   }
+-  if (cmd == "destination-start" && reverse && phase == Phase::Entered) {
++  if (cmd == "destination-start" && localAppKitTarget() && phase == Phase::Entered) {
+     const auto gen = static_cast<uint64_t>(generation);
+     const auto pid = m.value("pid").toInteger(-1);
+     const auto window = m.value("window").toInteger(-1);
+@@ -280,7 +328,7 @@ void EdgeRoute::command(const QJsonObject &m)
+       reject(requestId, "destination-start-unavailable"); return;
+     }
+     const auto nonce = (uint64_t{edgeinput::destinationMarker} << 32) | QRandomGenerator::system()->generate();
+-    const auto expires = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) + 300000000ULL;
++    const auto expires = uptimeNs() + 300000000ULL;
+     edgeinput::destinationPid = pid;
+     edgeinput::destinationWindow = window;
+     edgeinput::destinationExpiry = expires;
+@@ -290,7 +338,7 @@ void EdgeRoute::command(const QJsonObject &m)
+            {"expiresUptimeMs",expires / 1.e6},{"physicalDownEventNumber",physicalDownEventNumber}});
+     return;
+   }
+-  if (cmd == "target-started" && phase == Phase::Entered && reverse) {
++  if (cmd == "target-started" && phase == Phase::Entered && localAppKitTarget()) {
+     if (!screens.onPrimary() || edgeinput::button != static_cast<uint64_t>(generation * 2 + 1)) {
+       stop("released-before-target-start"); return;
+     }
+@@ -307,13 +355,14 @@ void EdgeRoute::command(const QJsonObject &m)
+   }
+   if (cmd == "source-accepted" && phase == Phase::Committing) {
+     auto entry = screens.map();
+-    bool accepted = reverse ? !commitToken.isEmpty() && m.value("commitToken").toString() == commitToken
+-                            : edgeinput::consumed == static_cast<uint64_t>(generation);
++    const bool tokenRequired = reverse || screens.primaryOle;
++    const bool accepted = (!tokenRequired || (!commitToken.isEmpty() && m.value("commitToken").toString() == commitToken)) &&
++                          (reverse || edgeinput::consumed == static_cast<uint64_t>(generation));
+     if (!accepted || !entry || !sameRoute(*entry) || !stillAt(*entry)) {
+       stop("source-or-edge-unverified");
+       return;
+     }
+-    physicalDownEventNumber = reverse ? edgeinput::downNumber.load() : 0;
++    physicalDownEventNumber = localAppKitTarget() ? edgeinput::downNumber.load() : 0;
+     if (edgeinput::button != static_cast<uint64_t>(generation * 2 + 1) ||
+         edgeinput::escaped == static_cast<uint64_t>(generation)) { stop("gesture-ended-before-switch"); return; }
+     if (reverse) edgeinput::reverseOwned = generation;
+@@ -321,7 +370,7 @@ void EdgeRoute::command(const QJsonObject &m)
+     phase = Phase::Entered;
+     deadline = Clock::now() + 2s;
+     QJsonObject entered{{"x", entry->x}, {"y", entry->y}, {"target", target}};
+-    if (reverse) entered.insert("physicalDownEventNumber", physicalDownEventNumber);
++    if (localAppKitTarget()) entered.insert("physicalDownEventNumber", physicalDownEventNumber);
+     notify("entered", entered);
+     return;
+   }
+@@ -330,7 +379,7 @@ void EdgeRoute::command(const QJsonObject &m)
+ void EdgeRoute::verifyTargetEnd(const QJsonObject &message)
+ {
+   const auto gen = static_cast<uint64_t>(generation);
+-  const auto now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1.e6;
++  const auto now = uptimeNs() / 1.e6;
+   const auto native = message.value("nativeEndedUptimeMs").toDouble(-1);
+   // The release may already have been delivered by Quartz while the server's
+   // periodic progress() has not emitted its "ended" notification yet.
+@@ -379,9 +428,9 @@ void EdgeRoute::progress()
+   if (edgeinput::escaped == gen) { stop("escape"); return; }
+   if (edgeinput::button != gen * 2 + 1) {
+     if (phase == Phase::Entered) {
+-      if (reverse && edgeinput::reverseDelivered != gen) { stop("released-before-target-start"); return; }
++      if (localAppKitTarget() && edgeinput::reverseDelivered != gen) { stop("released-before-target-start"); return; }
+       QJsonObject ended{{"reason", "released"}};
+-      if (reverse) {
++      if (localAppKitTarget()) {
+         ended.insert("physicalUpUptimeMs", edgeinput::reverseUpTimeNs.load() / 1.e6);
+         const qint64 upNumber = edgeinput::reverseUpNumber.load();
+         ended.insert("physicalDownEventNumber", physicalDownEventNumber);
+@@ -406,7 +455,7 @@ void EdgeRoute::progress()
+   if (phase != Phase::Entered && Clock::now() >= deadline) { stop("prepare-timeout"); return; }
+   if (phase == Phase::Entered) {
+     if (screens.current() != target.toStdString()) stop("target-left");
+-    else if (reverse && edgeinput::reverseArmed != gen && Clock::now() >= deadline) stop("target-start-timeout");
++    else if (localAppKitTarget() && edgeinput::reverseArmed != gen && Clock::now() >= deadline) stop("target-start-timeout");
+     return;
+   }
+   auto entry = screens.map();
+@@ -416,8 +465,12 @@ void EdgeRoute::progress()
+   if (phase != Phase::Ready || !atEdge || (reverse ? secondaryOutward : edgeinput::outward.load()) == baseline) return;
+   phase = Phase::Committing;
+   deadline = Clock::now() + 2s;
+-  if (reverse) {
++  if (reverse || screens.primaryOle) {
+     commitToken = QUuid::createUuid().toString(QUuid::WithoutBraces);
++    if (!reverse) {
++      edgeinput::windowsCommitTag = commitToken.first(8).toUInt(nullptr, 16);
++      edgeinput::permit = gen;
++    }
+     notify("commit", {{"commitToken",commitToken}});
+   } else {
+     edgeinput::permit = gen;
+@@ -467,11 +520,22 @@ void EdgeRoute::candidate()
+   nextCandidate = now + 100ms;
+   enqueue({{"event","candidate"},{"generation",gen},{"held",true},{"leaseMs",300},{"seq",++seq},
+            {"source",candidateSource},{"target",candidateTarget},{"edge",candidateEdge},
+-           {"observedUptimeMs",clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000000.0}});
++           {"observedUptimeMs",uptimeNs() / 1000000.0}});
+ }
+ void EdgeRoute::poll()
+ {
+   if (id.isEmpty() && phase == Phase::Finishing && Clock::now() >= deadline) reset();
++#ifdef _WIN32
++  if (!windowsPeer) {
++    if (!windowsPipe.accept()) return;
++    windowsPeer = true;
++    heartbeat = Clock::now();
++  }
++  char chunk[4096];
++  const auto received = windowsPipe.read(chunk, sizeof(chunk));
++  if (received < 0) { closePeer(); return; }
++  if (received) input.append(chunk, received);
++#else
+   if (peer < 0) {
+     int fd = accept(listener, nullptr, nullptr);
+     if (fd < 0) return;
+@@ -487,6 +551,7 @@ void EdgeRoute::poll()
+   auto n = recv(peer, chunk, sizeof(chunk), 0);
+   if (n == 0 || (n < 0 && !temporary())) { closePeer(); return; }
+   if (n > 0) input.append(chunk, n);
++#endif
+   if (input.size() > 16384 || output.size() > 16384) { closePeer(); return; }
+   progress();
+   for (int lines = 0; lines < 20; ++lines) {
+@@ -500,8 +565,14 @@ void EdgeRoute::poll()
+   }
+   candidate();
+   if (!output.isEmpty()) {
++#ifdef _WIN32
++    const auto sent = windowsPipe.write(output.constData(), static_cast<DWORD>(output.size()));
++    if (sent < 0) { closePeer(); return; }
++    output.remove(0, sent);
++#else
+     auto sent = send(peer, output.constData(), output.size(), 0);
+     if (sent > 0) output.remove(0, sent);
+     else if (sent == 0 || !temporary()) closePeer();
++#endif
+   }
+ }
+diff --git a/src/lib/server/EdgeRoute.h b/src/lib/server/EdgeRoute.h
+index e759bae..dabc6b6 100644
+--- a/src/lib/server/EdgeRoute.h
++++ b/src/lib/server/EdgeRoute.h
+@@ -7,7 +7,11 @@
+ #include <functional>
+ #include <optional>
+ #include <string>
++#ifdef _WIN32
++#include "server/WinRoutePipe.h"
++#else
+ #include <sys/types.h>
++#endif
+ 
+ class EdgeRoute
+ {
+@@ -23,10 +27,11 @@ public:
+     std::function<bool(const std::string &, const Entry &)> enter;
+     std::function<bool()> onPrimary;
+     std::function<std::string()> current;
++    bool primaryOle = false;
+   };
+   explicit EdgeRoute(Screens screens);
+   ~EdgeRoute();
+-  bool listening() const { return listener >= 0; }
++  bool listening() const;
+   bool active() const { return phase != Phase::Idle; }
+   void poll();
+   void secondaryMotion(int x, int leftEdge, int rightEdge, int dx);
+@@ -46,11 +51,17 @@ private:
+   void enqueue(const QJsonObject &);
+   void closePeer();
+   void reset();
++  bool localAppKitTarget() const { return reverse && !screens.primaryOle; }
+   Screens screens;
++#ifdef _WIN32
++  WinRoutePipe windowsPipe;
++  bool windowsPeer = false;
++#else
+   int listener = -1, peer = -1;
+   std::string socketPath;
+   dev_t socketDevice{};
+   ino_t socketInode{};
++#endif
+   QByteArray input, output;
+   QString id, source, target, commitToken;
+   bool reverse = false, edgeRight = true;
+diff --git a/src/lib/server/Server.cpp b/src/lib/server/Server.cpp
+index c290515..3be7dae 100644
+--- a/src/lib/server/Server.cpp
++++ b/src/lib/server/Server.cpp
+@@ -7,7 +7,7 @@
+  */
+ 
+ #include "server/Server.h"
+-#ifdef __APPLE__
++#if defined(__APPLE__) || defined(_WIN32)
+ #include "server/EdgeRoute.h"
+ #endif
+ 
+@@ -58,7 +58,7 @@ Server::Server(ServerConfig &config, PrimaryClient *primaryClient, deskflow::Com
+ 
+   std::string primaryName = getName(primaryClient);
+ 
+-#ifdef __APPLE__
++#if defined(__APPLE__) || defined(_WIN32)
+   if (auto *routePath = std::getenv("EDGEBRIDGE_ROUTE_SOCKET"); routePath && *routePath) {
+     m_edgeRoute = new EdgeRoute({
+       [this]() -> std::optional<EdgeRoute::Entry> {
+@@ -86,6 +86,9 @@ Server::Server(ServerConfig &config, PrimaryClient *primaryClient, deskflow::Com
+       },
+       [this] { return m_active == m_primaryClient; },
+       [this] { return getName(m_active); },
++#ifdef _WIN32
++      true,
++#endif
+     });
+     if (!m_edgeRoute->listening()) {
+       delete m_edgeRoute;
+@@ -195,7 +198,7 @@ Server::Server(ServerConfig &config, PrimaryClient *primaryClient, deskflow::Com
+ 
+ Server::~Server()
+ {
+-#ifdef __APPLE__
++#if defined(__APPLE__) || defined(_WIN32)
+   if (m_edgeRouteTimer) {
+     m_events->removeHandler(EventTypes::Timer, m_edgeRouteTimer);
+     m_events->deleteTimer(m_edgeRouteTimer);
+@@ -415,7 +418,7 @@ bool Server::isLockedToComputerServer() const
+ 
+ bool Server::isLockedToComputer() const
+ {
+-#ifdef __APPLE__
++#if defined(__APPLE__) || defined(_WIN32)
+   if (m_edgeRoute && m_edgeRoute->active()) return true;
+ #endif
+   if (m_disableLockToComputer) {
+@@ -1341,7 +1344,7 @@ void Server::handleSwitchWaitTimeout()
+ 
+ void Server::handleClientDisconnected(BaseClientProxy *client)
+ {
+-#ifdef __APPLE__
++#if defined(__APPLE__) || defined(_WIN32)
+   if (m_edgeRoute) m_edgeRoute->targetLost(getName(client));
+ #endif
+   // client has disconnected.  it might be an old client or an
+@@ -1820,7 +1823,7 @@ void Server::onMouseMoveSecondary(int32_t dx, int32_t dy)
+   int32_t ah;
+   m_active->getShape(ax, ay, aw, ah);
+ 
+-#ifdef __APPLE__
++#if defined(__APPLE__) || defined(_WIN32)
+   if (m_edgeRoute) m_edgeRoute->secondaryMotion(m_x, ax, ax + aw - 1, dx);
+ #endif
+ 
+diff --git a/src/lib/server/Server.h b/src/lib/server/Server.h
+index abed412..886fff1 100644
+--- a/src/lib/server/Server.h
++++ b/src/lib/server/Server.h
+@@ -40,7 +40,7 @@ This class implements the top-level server algorithms for deskflow.
+ */
+ class Server
+ {
+-#ifdef __APPLE__
++#if defined(__APPLE__) || defined(_WIN32)
+   EdgeRoute *m_edgeRoute = nullptr;
+   EventQueueTimer *m_edgeRouteTimer = nullptr;
+ #endif
+diff --git a/src/lib/server/WinRoutePipe.h b/src/lib/server/WinRoutePipe.h
+new file mode 100644
+index 0000000..42316b9
+--- /dev/null
++++ b/src/lib/server/WinRoutePipe.h
+@@ -0,0 +1,77 @@
++#pragma once
++
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#include <windows.h>
++#include <cstdint>
++#include <vector>
++
++class WinRoutePipe
++{
++public:
++  WinRoutePipe() = default;
++  WinRoutePipe(const WinRoutePipe &) = delete;
++  WinRoutePipe &operator=(const WinRoutePipe &) = delete;
++  ~WinRoutePipe() { if (handle != INVALID_HANDLE_VALUE) CloseHandle(handle); }
++
++  bool listen(const wchar_t *name)
++  {
++    if (listening()) return false;
++    HANDLE token;
++    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) return false;
++    DWORD size = 0;
++    GetTokenInformation(token, TokenUser, nullptr, 0, &size);
++    std::vector<uintptr_t> tokenData((size + sizeof(uintptr_t) - 1) / sizeof(uintptr_t));
++    const bool haveUser = size && GetTokenInformation(token, TokenUser, tokenData.data(), size, &size);
++    CloseHandle(token);
++    if (!haveUser) return false;
++    const auto sid = reinterpret_cast<const TOKEN_USER *>(tokenData.data())->User.Sid;
++    const auto aclSize = sizeof(ACL) + sizeof(ACCESS_ALLOWED_ACE) - sizeof(DWORD) + GetLengthSid(sid);
++    std::vector<uintptr_t> aclBuffer((aclSize + sizeof(uintptr_t) - 1) / sizeof(uintptr_t));
++    const auto acl = reinterpret_cast<PACL>(aclBuffer.data());
++    SECURITY_DESCRIPTOR descriptor{};
++    if (!InitializeAcl(acl, static_cast<DWORD>(aclSize), ACL_REVISION) ||
++        !AddAccessAllowedAce(acl, ACL_REVISION, FILE_GENERIC_READ | FILE_GENERIC_WRITE, sid) ||
++        !InitializeSecurityDescriptor(&descriptor, SECURITY_DESCRIPTOR_REVISION) ||
++        !SetSecurityDescriptorDacl(&descriptor, TRUE, acl, FALSE)) return false;
++    SECURITY_ATTRIBUTES attrs{sizeof(SECURITY_ATTRIBUTES), &descriptor, FALSE};
++    handle = CreateNamedPipeW(name, PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE,
++             PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_NOWAIT | PIPE_REJECT_REMOTE_CLIENTS,
++             1, 16384, 16384, 0, &attrs);
++    return listening();
++  }
++  bool listening() const { return handle != INVALID_HANDLE_VALUE; }
++  bool accept()
++  {
++    if (connected) return true;
++    if (ConnectNamedPipe(handle, nullptr)) return connected = true;
++    const auto error = GetLastError();
++    if (error == ERROR_PIPE_CONNECTED) return connected = true;
++    if (error == ERROR_NO_DATA) DisconnectNamedPipe(handle);
++    return false;
++  }
++  void disconnect()
++  {
++    if (connected) DisconnectNamedPipe(handle);
++    connected = false;
++  }
++  int read(char *chunk, DWORD size) const
++  {
++    DWORD available = 0;
++    if (!PeekNamedPipe(handle, nullptr, 0, nullptr, &available, nullptr)) return -1;
++    if (!available) return 0;
++    DWORD received = 0;
++    if (!ReadFile(handle, chunk, available < size ? available : size, &received, nullptr)) return -1;
++    return static_cast<int>(received);
++  }
++  int write(const char *chunk, DWORD size) const
++  {
++    DWORD written = 0;
++    if (!WriteFile(handle, chunk, size, &written, nullptr)) return -1;
++    return static_cast<int>(written);
++  }
++private:
++  HANDLE handle = INVALID_HANDLE_VALUE;
++  bool connected = false;
++};
+diff --git a/src/unittests/server/CMakeLists.txt b/src/unittests/server/CMakeLists.txt
+index a0e9420..d837ebf 100644
+--- a/src/unittests/server/CMakeLists.txt
++++ b/src/unittests/server/CMakeLists.txt
+@@ -4,6 +4,12 @@
+ if(WIN32)
+   set(extra_libs version app mt net)
+ endif()
++if(WIN32)
++  add_executable(WinRoutePipeTests WinRoutePipeTests.cpp)
++  target_include_directories(WinRoutePipeTests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../lib)
++  target_link_libraries(WinRoutePipeTests PRIVATE advapi32)
++  add_test(NAME WinRoutePipeTests COMMAND WinRoutePipeTests)
++endif()
+ 
+ create_test(
+   NAME ServerConfigTests
+@@ -41,6 +47,7 @@ if(APPLE)
+   target_link_libraries(EdgeRouteSocketTests PRIVATE server Qt6::Core)
+   add_test(NAME EdgeRouteSocketTests COMMAND EdgeRouteSocketTests)
+   add_test(NAME EdgeRouteSocketMirroredTests COMMAND EdgeRouteSocketTests --mirrored)
++  add_test(NAME EdgeRouteSocketOlePolicyTests COMMAND EdgeRouteSocketTests --ole)
+   add_executable(EdgeRouteSocketLifecycleTests EdgeRouteSocketLifecycleTests.cpp)
+   target_link_libraries(EdgeRouteSocketLifecycleTests PRIVATE server Qt6::Core)
+   add_test(NAME EdgeRouteSocketLifecycleTests COMMAND EdgeRouteSocketLifecycleTests)
+diff --git a/src/unittests/server/EdgeRouteInputTests.cpp b/src/unittests/server/EdgeRouteInputTests.cpp
+index b7173ff..11be47c 100644
+--- a/src/unittests/server/EdgeRouteInputTests.cpp
++++ b/src/unittests/server/EdgeRouteInputTests.cpp
+@@ -43,5 +43,19 @@ int main()
+   leased = 0; // disconnected during the consumed drag
+   CHECK(up() && !finishing);
+   CHECK(!down(700) && !up());
+-  std::puts("PASS: physical generations, marker bounds/replay, early Escape, release drain and disconnect");
++  CHECK(!down(800));
++  auto generation = button.load() >> 1;
++  leased = generation;
++  permit = generation;
++  windowsSourceWindow = 123;
++  windowsCommitTag = 0x29467501;
++  auto tag = (uint64_t{windowsCommitTag.load()} << 32) | marker;
++  motion(999, 1);
++  CHECK(!acceptWindowsRelease(tag, 124, 999));
++  CHECK(!acceptWindowsRelease(tag ^ (uint64_t{1} << 32), 123, 999));
++  CHECK(!acceptWindowsRelease(tag, 123, 998));
++  CHECK(acceptWindowsRelease(tag, 123, 999));
++  CHECK(!acceptWindowsRelease(tag, 123, 999));
++  CHECK(up());
++  std::puts("PASS: physical generations, scoped Windows window and nonce, marker replay, release and disconnect");
+ }
+diff --git a/src/unittests/server/EdgeRouteSocketTests.cpp b/src/unittests/server/EdgeRouteSocketTests.cpp
+index 70ddf58..5015bbd 100644
+--- a/src/unittests/server/EdgeRouteSocketTests.cpp
++++ b/src/unittests/server/EdgeRouteSocketTests.cpp
+@@ -17,6 +17,7 @@
+ int main(int argc, char **argv)
+ {
+   const bool mirrored = argc == 2 && std::strcmp(argv[1], "--mirrored") == 0;
++  const bool ole = argc == 2 && std::strcmp(argv[1], "--ole") == 0;
+   const auto point = [mirrored](int x) { return mirrored ? 999 - x : x; };
+   const auto delta = [mirrored](int dx) { return mirrored ? -dx : dx; };
+   const auto drag = [&](int x, int dx) { edgeinput::leftDrag(point(x), 0, delta(dx), 0); };
+@@ -45,7 +46,7 @@ int main(int argc, char **argv)
+         releaseDuringProgress = 0;
+       }
+       return current;
+-    }
++    }, ole
+   });
+   CHECK(route.listening());
+   int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+@@ -76,6 +77,7 @@ int main(int argc, char **argv)
+   auto id = QUuid::createUuid().toString(QUuid::WithoutBraces);
+   auto t = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+   QJsonObject prepare{{"command","prepare"},{"id",id},{"edge",macEdge},{"target","win"},{"observedGeneration",1},{"observedUptimeMs",t/1.e6}};
++  if (ole) prepare["sourceWindow"] = "123";
+   auto command = [&](const char *cmd, int generation) {
+     return QJsonObject{{"command",cmd},{"id",id},{"generation",generation}};
+   };
+@@ -104,15 +106,25 @@ int main(int argc, char **argv)
+   CHECK(step(command("ready", 1))["event"] == "ready");
+   CHECK(step().isEmpty());
+   motion(999, 2);
+-  CHECK(step()["event"] == "commit");
++  auto forwardCommit = step();
++  CHECK(forwardCommit["event"] == "commit");
++  CHECK(!ole || forwardCommit["commitToken"].isString());
+   CHECK(current == "mac");
+   CHECK(!edgeinput::acceptMarker(1, point(998)));
+-  CHECK(edgeinput::acceptMarker(1, point(999)));
++  if (ole) {
++    auto tag = (uint64_t{forwardCommit["commitToken"].toString().left(8).toUInt(nullptr, 16)} << 32) | edgeinput::marker;
++    CHECK(!edgeinput::acceptWindowsRelease(tag, 124, point(999)));
++    CHECK(!edgeinput::acceptWindowsRelease(tag ^ (uint64_t{1} << 32), 123, point(999)));
++    CHECK(edgeinput::acceptWindowsRelease(tag, 123, point(999)));
++    CHECK(!edgeinput::acceptWindowsRelease(tag, 123, point(999)));
++  } else CHECK(edgeinput::acceptMarker(1, point(999)));
+   auto count = hints.size();
+   usleep(110000);
+   step();
+   CHECK(hints.size() == count + 1 && hints.back()["event"] == "candidate");
+-  CHECK(step(command("source-accepted",1))["event"] == "entered" && current == "win");
++  auto forwardAccepted = command("source-accepted",1);
++  if (ole) forwardAccepted["commitToken"] = forwardCommit["commitToken"];
++  CHECK(step(forwardAccepted)["event"] == "entered" && current == "win");
+   CHECK(hints.back()["event"] == "candidate-ended");
+   CHECK(edgeinput::up());
+   CHECK(step()["event"] == "ended" && route.active());
+@@ -140,8 +152,11 @@ int main(int argc, char **argv)
+   CHECK(step(prepare)["event"] == "prepared");
+   CHECK(step(command("ready",4))["event"] == "ready");
+   motion(999,2);
+-  CHECK(step()["event"] == "commit" && edgeinput::acceptMarker(4,point(999)));
+-  CHECK(step(command("source-accepted",4))["event"] == "entered");
++  auto laterCommit = step();
++  CHECK(laterCommit["event"] == "commit" && edgeinput::acceptMarker(4,point(999)));
++  auto laterAccepted = command("source-accepted",4);
++  if (ole) laterAccepted["commitToken"] = laterCommit["commitToken"];
++  CHECK(step(laterAccepted)["event"] == "entered");
+   close(fd);
+   route.poll();
+   CHECK(route.active() && edgeinput::up());
+@@ -198,6 +213,15 @@ int main(int argc, char **argv)
+     }
+     auto entered = step(accepted);
+     CHECK(entered["event"] == "entered" && current == "mac");
++    if (ole) {
++      CHECK(!entered.contains("physicalDownEventNumber"));
++      CHECK(step(command("destination-start",gen))["event"] == "rejected");
++      CHECK(edgeinput::up(true));
++      CHECK(step()["event"] == "ended");
++      CHECK(step(command("finish",gen))["event"] == "finished" && !route.active());
++      close(fd);
++      return 0;
++    }
+     CHECK(entered["physicalDownEventNumber"].toInteger(-1) == downNumber);
+     if (outcome == Outcome::EarlyUp) {
+       CHECK(edgeinput::up(true)); // no local session may receive this mouse-up
+diff --git a/src/unittests/server/WinRoutePipeTests.cpp b/src/unittests/server/WinRoutePipeTests.cpp
+new file mode 100644
+index 0000000..2ce3f35
+--- /dev/null
++++ b/src/unittests/server/WinRoutePipeTests.cpp
+@@ -0,0 +1,36 @@
++#include "server/WinRoutePipe.h"
++
++#include <cstdio>
++#include <cstring>
++#include <string>
++
++#define CHECK(value) do { if (!(value)) { std::fprintf(stderr, "failure at line %d (Win32 error %lu)\n", __LINE__, GetLastError()); return 1; } } while (false)
++
++int main()
++{
++  WinRoutePipe pipe, duplicate;
++  const auto name = std::wstring(L"\\\\.\\pipe\\edgebridge-test-") + std::to_wstring(GetCurrentProcessId());
++  CHECK(pipe.listen(name.c_str()));
++  CHECK(!duplicate.listen(name.c_str()));
++  CHECK(!pipe.accept());
++  const auto connect = [&] { return CreateFileW(name.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr); };
++  HANDLE client = connect();
++  CHECK(client != INVALID_HANDLE_VALUE && pipe.accept());
++  char chunk[32]{};
++  CHECK(pipe.read(chunk, sizeof(chunk)) == 0);
++  DWORD count = 0;
++  CHECK(WriteFile(client, "hel", 3, &count, nullptr) && count == 3);
++  CHECK(pipe.read(chunk, sizeof(chunk)) == 3 && std::memcmp(chunk, "hel", 3) == 0);
++  CHECK(WriteFile(client, "lo\n", 3, &count, nullptr) && count == 3);
++  CHECK(pipe.read(chunk, sizeof(chunk)) == 3 && std::memcmp(chunk, "lo\n", 3) == 0);
++  CHECK(pipe.write("ok\n", 3) == 3);
++  CHECK(ReadFile(client, chunk, sizeof(chunk), &count, nullptr) && count == 3 && std::memcmp(chunk, "ok\n", 3) == 0);
++  CloseHandle(client);
++  CHECK(pipe.read(chunk, sizeof(chunk)) < 0);
++  pipe.disconnect();
++  CHECK(!pipe.accept());
++  client = connect();
++  CHECK(client != INVALID_HANDLE_VALUE && pipe.accept());
++  CloseHandle(client);
++  std::puts("PASS: Windows local named pipe ownership, bidirectional data, EOF and reconnect");
++}
