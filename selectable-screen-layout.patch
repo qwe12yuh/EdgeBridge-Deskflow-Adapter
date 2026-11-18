@@ -1,0 +1,371 @@
+diff --git a/src/lib/deskflow/EdgeRouteInput.h b/src/lib/deskflow/EdgeRouteInput.h
+index 02378c3..0737872 100644
+--- a/src/lib/deskflow/EdgeRouteInput.h
++++ b/src/lib/deskflow/EdgeRouteInput.h
+@@ -27,6 +27,7 @@ inline std::atomic<unsigned> reverseMoves{0}, reverseDrags{0};
+ inline std::atomic<int> travelX{0}, travelY{0};
+ inline std::atomic<uint64_t> finishing{0}, tapFault{0};
+ inline std::atomic<int> boundary{std::numeric_limits<int>::max()};
++inline std::atomic<bool> boundaryRight{true};
+ inline std::atomic<uint64_t> outward{0};
+ inline std::atomic<bool> atBoundary{false};
+ inline std::atomic<uint64_t> downSeen{0}, dragSeen{0}, acceptedDrags{0}, draggedGeneration{0};
+@@ -154,12 +155,13 @@ inline void offscreenMotion(int dx, int dy)
+ }
+ inline void motion(int x, int dx)
+ {
+-  atBoundary = x >= boundary.load();
+-  if (atBoundary && dx > 0 && (button.load() & 1)) ++outward;
++  const auto right = boundaryRight.load();
++  atBoundary = right ? x >= boundary.load() : x <= boundary.load();
++  if (atBoundary && (right ? dx > 0 : dx < 0) && (button.load() & 1)) ++outward;
+ }
+ inline bool acceptMarker(uint64_t gen, int x)
+ {
+-  if (!gen || button.load() != gen * 2 + 1 || x < boundary.load() ||
++  if (!gen || button.load() != gen * 2 + 1 || (boundaryRight.load() ? x < boundary.load() : x > boundary.load()) ||
+       !atBoundary || escaped.load() == gen || !permit.compare_exchange_strong(gen, 0)) return false;
+   consumed = gen;
+   return true;
+diff --git a/src/lib/server/EdgeRoute.cpp b/src/lib/server/EdgeRoute.cpp
+index a2c852e..78f131e 100644
+--- a/src/lib/server/EdgeRoute.cpp
++++ b/src/lib/server/EdgeRoute.cpp
+@@ -47,6 +47,11 @@ bool reclaimRefusedSocket(const sockaddr_un &addr)
+   return unlink(addr.sun_path) == 0;
+ }
+ bool temporary() { return errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR; }
++int edgeDistance(const EdgeRoute::Entry &entry)
++{
++  const int x = entry.fromPrimary ? edgeinput::dragX.load() : entry.sourceX;
++  return entry.right ? entry.edge - x : x - entry.edge;
++}
+ }
+ 
+ EdgeRoute::EdgeRoute(Screens s) : screens(std::move(s))
+@@ -153,7 +158,7 @@ void EdgeRoute::notify(const QString &type, QJsonObject data)
+   data.insert("generation", generation);
+   data.insert("source", source);
+   data.insert("target", target);
+-  data.insert("edge", reverse ? "left" : "right");
++  data.insert("edge", edgeRight ? "right" : "left");
+   data.insert("seq", ++seq);
+   enqueue(data);
+ }
+@@ -189,8 +194,8 @@ void EdgeRoute::command(const QJsonObject &m)
+     enqueue({{"event","status"},{"seq",++seq},{"onPrimary",screens.onPrimary()},{"held",bool(state & 1)},
+              {"generation",static_cast<qint64>(state >> 1)},{"downSeen",static_cast<qint64>(edgeinput::downSeen.load())},
+              {"dragSeen",static_cast<qint64>(edgeinput::dragSeen.load())},
+-             {"acceptedDrags",static_cast<qint64>(edgeinput::acceptedDrags.load())},{"nearRight",entry && entry->fromPrimary && entry->edge - edgeinput::dragX.load() <= 128},
+-             {"nearLeft",entry && !entry->fromPrimary && entry->sourceX - entry->edge <= 128},
++             {"acceptedDrags",static_cast<qint64>(edgeinput::acceptedDrags.load())},{"nearRight",entry && entry->right && edgeDistance(*entry) <= 128},
++             {"nearLeft",entry && !entry->right && edgeDistance(*entry) <= 128},
+              {"screen",QString::fromStdString(screens.current())}});
+     return;
+   }
+@@ -221,14 +226,19 @@ void EdgeRoute::command(const QJsonObject &m)
+     if (!entry || (offeredSource.isEmpty() ? !entry->fromPrimary : offeredSource != entry->source) ||
+         entry->source != candidateSource || entry->target != candidateTarget ||
+         m.value("target").toString() != entry->target || m.value("edge").toString() != candidateEdge ||
+-        (entry->fromPrimary ? entry->edge - edgeinput::dragX.load() : entry->sourceX - entry->edge) > 128) {
++        (entry->right ? "right" : "left") != candidateEdge || edgeDistance(*entry) > 128) {
+       reject(requestId, "source-or-target-unavailable");
+       return;
+     }
+     reverse = !entry->fromPrimary;
++    edgeRight = entry->right;
+     source = entry->source;
+     target = entry->target;
+-    if (!reverse) edgeinput::boundary = entry->edge;
++    if (!reverse) {
++      edgeinput::atBoundary = false;
++      edgeinput::boundary = entry->edge;
++      edgeinput::boundaryRight = edgeRight;
++    }
+     generation = static_cast<qint64>(state >> 1);
+     lastPrepared = generation;
+     tapGeneration = edgeinput::tapFault;
+@@ -252,7 +262,7 @@ void EdgeRoute::command(const QJsonObject &m)
+   if (cmd == "cancel" && phase == Phase::Finishing) return;
+   if (cmd == "cancel") { stop("coordinator-cancelled"); return; }
+   if (cmd == "ready" && phase == Phase::Prepared) {
+-    baseline = reverse ? leftOutward : edgeinput::outward.load();
++    baseline = reverse ? secondaryOutward : edgeinput::outward.load();
+     phase = Phase::Ready;
+     deadline = Clock::now() + 30s;
+     notify("ready");
+@@ -403,7 +413,7 @@ void EdgeRoute::progress()
+   if (!entry || !sameRoute(*entry)) { stop("source-left"); return; }
+   bool atEdge = stillAt(*entry);
+   if (phase == Phase::Committing && !atEdge) { stop("edge-left"); return; }
+-  if (phase != Phase::Ready || !atEdge || (reverse ? leftOutward : edgeinput::outward.load()) == baseline) return;
++  if (phase != Phase::Ready || !atEdge || (reverse ? secondaryOutward : edgeinput::outward.load()) == baseline) return;
+   phase = Phase::Committing;
+   deadline = Clock::now() + 2s;
+   if (reverse) {
+@@ -416,17 +426,17 @@ void EdgeRoute::progress()
+ }
+ bool EdgeRoute::sameRoute(const Entry &entry) const
+ {
+-  return entry.fromPrimary != reverse && entry.source == source && entry.target == target;
++  return entry.fromPrimary != reverse && entry.right == edgeRight && entry.source == source && entry.target == target;
+ }
+ bool EdgeRoute::stillAt(const Entry &entry) const
+ {
+-  return entry.fromPrimary ? edgeinput::atBoundary.load() : entry.sourceX <= entry.edge;
++  return entry.fromPrimary ? edgeinput::atBoundary.load() : edgeDistance(entry) <= 0;
+ }
+-void EdgeRoute::secondaryMotion(int x, int leftEdge, int dx)
++void EdgeRoute::secondaryMotion(int x, int leftEdge, int rightEdge, int dx)
+ {
+   // Called by the normal Deskflow motion queue after applying the raw delta
+   // to the secondary's virtual pointer and before clamping it to the screen.
+-  if (reverse && phase == Phase::Ready && dx < 0 && x <= leftEdge) ++leftOutward;
++  if (reverse && phase == Phase::Ready && (edgeRight ? dx > 0 && x >= rightEdge : dx < 0 && x <= leftEdge)) ++secondaryOutward;
+ }
+ void EdgeRoute::candidate()
+ {
+@@ -440,11 +450,11 @@ void EdgeRoute::candidate()
+                    (phase == Phase::Idle && lastPrepared != gen && !edgeinput::tookSourceLeft()));
+   auto entry = eligible ? screens.map() : std::nullopt;
+   if (entry) {
+-    int distance = entry->fromPrimary ? entry->edge - edgeinput::dragX.load() : entry->sourceX - entry->edge;
++    int distance = edgeDistance(*entry);
+     if (distance < 0 || distance > 128) entry.reset();
+   }
+   if (candidateGeneration && (!entry || candidateGeneration != gen || candidateSource != entry->source ||
+-                              candidateTarget != entry->target)) {
++                              candidateTarget != entry->target || candidateEdge != (entry->right ? "right" : "left"))) {
+     enqueue({{"event","candidate-ended"},{"generation",candidateGeneration},{"seq",++seq},
+              {"source",candidateSource},{"target",candidateTarget},{"edge",candidateEdge}});
+     candidateGeneration = 0;
+@@ -453,7 +463,7 @@ void EdgeRoute::candidate()
+   candidateGeneration = gen;
+   candidateSource = entry->source;
+   candidateTarget = entry->target;
+-  candidateEdge = entry->fromPrimary ? "right" : "left";
++  candidateEdge = entry->right ? "right" : "left";
+   nextCandidate = now + 100ms;
+   enqueue({{"event","candidate"},{"generation",gen},{"held",true},{"leaseMs",300},{"seq",++seq},
+            {"source",candidateSource},{"target",candidateTarget},{"edge",candidateEdge},
+diff --git a/src/lib/server/EdgeRoute.h b/src/lib/server/EdgeRoute.h
+index 792b119..e759bae 100644
+--- a/src/lib/server/EdgeRoute.h
++++ b/src/lib/server/EdgeRoute.h
+@@ -16,6 +16,7 @@ public:
+     int edge, x, y, sourceX;
+     bool fromPrimary;
+     QString source, target;
++    bool right = fromPrimary;
+   };
+   struct Screens {
+     std::function<std::optional<Entry>()> map;
+@@ -28,7 +29,7 @@ public:
+   bool listening() const { return listener >= 0; }
+   bool active() const { return phase != Phase::Idle; }
+   void poll();
+-  void secondaryMotion(int x, int leftEdge, int dx);
++  void secondaryMotion(int x, int leftEdge, int rightEdge, int dx);
+   void targetLost(const std::string &name);
+   void stop(const QString &reason, QJsonObject detail = {});
+ private:
+@@ -52,13 +53,13 @@ private:
+   ino_t socketInode{};
+   QByteArray input, output;
+   QString id, source, target, commitToken;
+-  bool reverse = false;
++  bool reverse = false, edgeRight = true;
+   Phase phase = Phase::Idle;
+   qint64 generation = 0, lastPrepared = 0, seq = 0;
+   uint64_t baseline = 0, tapGeneration = 0;
+   qint64 candidateGeneration = 0;
+   qint64 physicalDownEventNumber = 0;
+-  uint64_t leftOutward = 0;
++  uint64_t secondaryOutward = 0;
+   QString candidateSource, candidateTarget, candidateEdge;
+   Clock::time_point heartbeat, deadline, nextCandidate;
+ };
+diff --git a/src/lib/server/Server.cpp b/src/lib/server/Server.cpp
+index 7f0c014..c290515 100644
+--- a/src/lib/server/Server.cpp
++++ b/src/lib/server/Server.cpp
+@@ -67,12 +67,16 @@ Server::Server(ServerConfig &config, PrimaryClient *primaryClient, deskflow::Com
+         m_active->getShape(ax, ay, aw, ah);
+         if (aw < 2 || ah < 2) return {};
+         bool primary = m_active == m_primaryClient;
+-        int x = primary ? ax + aw : ax - 1;
+-        int y = std::clamp(m_y, ay, ay + ah - 1);
+-        auto *dst = mapToNeighbor(m_active, primary ? Direction::Right : Direction::Left, x, y);
+-        if (!dst || dst == m_active || (!primary && dst != m_primaryClient)) return {};
+-        return EdgeRoute::Entry{primary ? ax + aw - 1 : ax, x, y, m_x, primary,
+-                                QString::fromStdString(getName(m_active)), QString::fromStdString(getName(dst))};
++        auto forEdge = [&](bool right) -> std::optional<EdgeRoute::Entry> {
++          int x = right ? ax + aw : ax - 1;
++          int y = std::clamp(m_y, ay, ay + ah - 1);
++          auto *dst = mapToNeighbor(m_active, right ? Direction::Right : Direction::Left, x, y);
++          if (!dst || dst == m_active || (!primary && dst != m_primaryClient)) return {};
++          return EdgeRoute::Entry{right ? ax + aw - 1 : ax, x, y, m_x, primary,
++                                  QString::fromStdString(getName(m_active)), QString::fromStdString(getName(dst)), right};
++        };
++        auto preferred = forEdge(primary);
++        return preferred ? preferred : forEdge(!primary);
+       },
+       [this](const std::string &name, const EdgeRoute::Entry &entry) {
+         auto client = m_clients.find(name);
+@@ -1817,7 +1821,7 @@ void Server::onMouseMoveSecondary(int32_t dx, int32_t dy)
+   m_active->getShape(ax, ay, aw, ah);
+ 
+ #ifdef __APPLE__
+-  if (m_edgeRoute) m_edgeRoute->secondaryMotion(m_x, ax, dx);
++  if (m_edgeRoute) m_edgeRoute->secondaryMotion(m_x, ax, ax + aw - 1, dx);
+ #endif
+ 
+   // find direction of neighbor and get the neighbor
+diff --git a/src/unittests/server/CMakeLists.txt b/src/unittests/server/CMakeLists.txt
+index e38af8e..a0e9420 100644
+--- a/src/unittests/server/CMakeLists.txt
++++ b/src/unittests/server/CMakeLists.txt
+@@ -40,6 +40,7 @@ if(APPLE)
+   add_executable(EdgeRouteSocketTests EdgeRouteSocketTests.cpp)
+   target_link_libraries(EdgeRouteSocketTests PRIVATE server Qt6::Core)
+   add_test(NAME EdgeRouteSocketTests COMMAND EdgeRouteSocketTests)
++  add_test(NAME EdgeRouteSocketMirroredTests COMMAND EdgeRouteSocketTests --mirrored)
+   add_executable(EdgeRouteSocketLifecycleTests EdgeRouteSocketLifecycleTests.cpp)
+   target_link_libraries(EdgeRouteSocketLifecycleTests PRIVATE server Qt6::Core)
+   add_test(NAME EdgeRouteSocketLifecycleTests COMMAND EdgeRouteSocketLifecycleTests)
+diff --git a/src/unittests/server/EdgeRouteSocketTests.cpp b/src/unittests/server/EdgeRouteSocketTests.cpp
+index cc9b4a8..70ddf58 100644
+--- a/src/unittests/server/EdgeRouteSocketTests.cpp
++++ b/src/unittests/server/EdgeRouteSocketTests.cpp
+@@ -14,8 +14,15 @@
+ // Drive the actual local socket and route machine with virtual screens and
+ // in-memory physical input. No Deskflow instance, event tap or UI is started.
+ #define CHECK(value) do { if (!(value)) { std::fprintf(stderr, "failure at line %d\n", __LINE__); return 1; } } while (false)
+-int main()
++int main(int argc, char **argv)
+ {
++  const bool mirrored = argc == 2 && std::strcmp(argv[1], "--mirrored") == 0;
++  const auto point = [mirrored](int x) { return mirrored ? 999 - x : x; };
++  const auto delta = [mirrored](int dx) { return mirrored ? -dx : dx; };
++  const auto drag = [&](int x, int dx) { edgeinput::leftDrag(point(x), 0, delta(dx), 0); };
++  const auto motion = [&](int x, int dx) { edgeinput::motion(point(x), delta(dx)); };
++  const char *macEdge = mirrored ? "left" : "right";
++  const char *winEdge = mirrored ? "right" : "left";
+   QTemporaryDir dir("/tmp/df-route-test-XXXXXX");
+   CHECK(dir.isValid());
+   auto path = (dir.path() + "/ipc").toUtf8();
+@@ -27,8 +34,8 @@ int main()
+   uint64_t releaseDuringProgress = 0;
+   EdgeRoute route({
+     [&]() -> std::optional<EdgeRoute::Entry> {
+-      if (current == "mac") return EdgeRoute::Entry{999, 0, 20, 999, true, "mac", "win"};
+-      return EdgeRoute::Entry{0, 998, 20, winX, false, "win", "mac"};
++      if (current == "mac") return EdgeRoute::Entry{point(999), point(0), 20, point(999), true, "mac", "win", !mirrored};
++      return EdgeRoute::Entry{point(0), point(998), 20, point(winX), false, "win", "mac", mirrored};
+     },
+     [&](const std::string &name, const EdgeRoute::Entry &) { current = name; return true; },
+     [&] { return current == "mac"; }, [&] {
+@@ -68,24 +75,24 @@ int main()
+   };
+   auto id = QUuid::createUuid().toString(QUuid::WithoutBraces);
+   auto t = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+-  QJsonObject prepare{{"command","prepare"},{"id",id},{"edge","right"},{"target","win"},{"observedGeneration",1},{"observedUptimeMs",t/1.e6}};
++  QJsonObject prepare{{"command","prepare"},{"id",id},{"edge",macEdge},{"target","win"},{"observedGeneration",1},{"observedUptimeMs",t/1.e6}};
+   auto command = [&](const char *cmd, int generation) {
+     return QJsonObject{{"command",cmd},{"id",id},{"generation",generation}};
+   };
+   CHECK(step(prepare)["event"] == "rejected");
+-  edgeinput::down(t, 700, 0);
++  edgeinput::down(t, point(700), 0);
+   step();
+   CHECK(hints.isEmpty()); // ordinary press does not arm the strip
+-  edgeinput::leftDrag(710, 0, 10, 0);
++  drag(710, 10);
+   step();
+   CHECK(hints.isEmpty()); // far from the edge
+-  edgeinput::leftDrag(940, 0, 10, 0);
++  drag(940, 10);
+   step();
+   CHECK(hints.size() == 1 && hints.back()["event"] == "candidate" && hints.back()["generation"] == 1);
+-  edgeinput::leftDrag(800, 0, -20, 0);
++  drag(800, -20);
+   step();
+   CHECK(hints.back()["event"] == "candidate-ended");
+-  edgeinput::leftDrag(995, 0, 10, 0);
++  drag(995, 10);
+   step();
+   CHECK(hints.back()["event"] == "candidate");
+   CHECK(step({{"command","status"}})["acceptedDrags"].toInt() >= 3);
+@@ -93,13 +100,14 @@ int main()
+   CHECK(step(prepare)["reason"] == "stale-source-generation");
+   prepare.insert("observedGeneration",1);
+   CHECK(step(prepare)["event"] == "prepared");
+-  edgeinput::motion(999, 1); // before ready, cannot trigger commit
++  motion(999, 1); // before ready, cannot trigger commit
+   CHECK(step(command("ready", 1))["event"] == "ready");
+   CHECK(step().isEmpty());
+-  edgeinput::motion(999, 2);
++  motion(999, 2);
+   CHECK(step()["event"] == "commit");
+   CHECK(current == "mac");
+-  CHECK(edgeinput::acceptMarker(1,999));
++  CHECK(!edgeinput::acceptMarker(1, point(998)));
++  CHECK(edgeinput::acceptMarker(1, point(999)));
+   auto count = hints.size();
+   usleep(110000);
+   step();
+@@ -115,7 +123,7 @@ int main()
+   t = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+   CHECK(!edgeinput::down(t));
+   CHECK(step(prepare)["event"] == "rejected"); // request belongs to a previous physical down
+-  edgeinput::leftDrag(995, 0, 10, 0);
++  drag(995, 10);
+   step();
+   prepare.insert("observedGeneration", static_cast<qint64>(edgeinput::button.load() >> 1));
+   prepare.insert("observedUptimeMs",t/1.e6);
+@@ -125,14 +133,14 @@ int main()
+   CHECK(step()["reason"] == "released-before-entry" && current == "mac");
+   t = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+   edgeinput::down(t);
+-  edgeinput::leftDrag(995, 0, 10, 0);
++  drag(995, 10);
+   step();
+   prepare.insert("observedGeneration", static_cast<qint64>(edgeinput::button.load() >> 1));
+   prepare.insert("observedUptimeMs",t/1.e6);
+   CHECK(step(prepare)["event"] == "prepared");
+   CHECK(step(command("ready",4))["event"] == "ready");
+-  edgeinput::motion(999,2);
+-  CHECK(step()["event"] == "commit" && edgeinput::acceptMarker(4,999));
++  motion(999,2);
++  CHECK(step()["event"] == "commit" && edgeinput::acceptMarker(4,point(999)));
+   CHECK(step(command("source-accepted",4))["event"] == "entered");
+   close(fd);
+   route.poll();
+@@ -166,21 +174,21 @@ int main()
+     winX = 80;
+     step();
+     CHECK(hints.size() == n+1 && hints.back()["source"] == "win" &&
+-          hints.back()["target"] == "mac" && hints.back()["edge"] == "left");
++          hints.back()["target"] == "mac" && hints.back()["edge"] == winEdge);
+     QJsonObject offer{{"command","prepare"},{"id",id},{"source","win"},{"target","mac"},
+-                      {"edge","left"},{"observedGeneration",gen},{"observedUptimeMs",hints.back()["observedUptimeMs"]}};
++                      {"edge",winEdge},{"observedGeneration",gen},{"observedUptimeMs",hints.back()["observedUptimeMs"]}};
+     auto wrong = offer;
+     wrong["source"] = "mac";
+     CHECK(step(wrong)["event"] == "rejected");
+     CHECK(step(offer)["event"] == "prepared");
+     winX = 0;
+-    route.secondaryMotion(0, 0, -5); // crossing before Ready cannot commit
++    route.secondaryMotion(point(0), 0, 999, delta(-5)); // crossing before Ready cannot commit
+     CHECK(step(command("ready",gen))["event"] == "ready");
+-    route.secondaryMotion(0, 0, 1);
++    route.secondaryMotion(point(0), 0, 999, delta(1));
+     CHECK(step().isEmpty());
+-    route.secondaryMotion(-3, 0, -3);
++    route.secondaryMotion(point(-3), 0, 999, delta(-3));
+     auto commit = step();
+-    CHECK(commit["event"] == "commit" && commit["edge"] == "left" && !edgeinput::permit);
++    CHECK(commit["event"] == "commit" && commit["edge"] == winEdge && !edgeinput::permit);
+     auto accepted = command("source-accepted",gen);
+     accepted["commitToken"] = outcome == Outcome::WrongToken ? QJsonValue("old") : commit["commitToken"];
+     if (outcome == Outcome::WrongToken) {
