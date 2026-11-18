@@ -21,6 +21,15 @@ test "$(git rev-parse HEAD)" = 081f6478e654a112168879e67a41ce7d7e4ae3af &&
 
 The patch SHA-256 is `d6543cf4eedbcc7db80769d05d3c4c50b1277ad782a479710a3535a5da331c4c`.
 
+For selectable horizontal layouts, apply [selectable-screen-layout.patch](selectable-screen-layout.patch) after the base patch, then rebuild:
+
+```sh
+git apply --check "$adapter_root/selectable-screen-layout.patch"
+git apply "$adapter_root/selectable-screen-layout.patch"
+```
+
+The second patch follows the configured adjacent screen instead of assuming the Mac is on the left. It adds a mirrored run of the existing socket regression; use it with EdgeBridge's corresponding coordinator and native helpers. Its SHA-256 is `2f3cfb433bcc45d20642ba70edb9cad80a3c3151b2a9b92b82b07bbbfa56ba0a`.
+
 ## Build on macOS
 
 The verified Apple Silicon build used the Xcode Command Line Tools, CMake 4.5, Ninja 1.13, Qt 6.12 (including Qt Linguist Tools) and OpenSSL 4 from Homebrew. From the patched Deskflow checkout:
